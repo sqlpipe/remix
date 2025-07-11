@@ -1,0 +1,9 @@
+.envrc
+bin/*
+.idea
+/hidden
+.hidden
+*/.DS_Store
+cmd/remix/sample.yaml
+/test/config/*
+gitleaks-report.json
