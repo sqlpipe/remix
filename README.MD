@@ -6,7 +6,7 @@ Remix is a free, open-source data streaming solution, written in Golang. It has 
 - Facilitate the curation of high quality AI training datasets.
 - Encourage the creation of canonical data models that can be enforced across your organization.
 
-**Data Replication**
+### Data Replication
 
 Remix features a "fan-in, fan-out" architecture when replicating data. It pulls in data, transforms it to fit into predefined models that you define, and puts objects in a queue. Then, for each system that you want to push to, it transforms the objects to a format that the target system will accept, and pushes to it.
 
@@ -14,13 +14,13 @@ We call the process of transforming the data "remixing". Right now, remixing sim
 
 Just remember, data is remixed on the way in to fit your canonical data models, then remixed on the way out to be accepted by target systems.
 
-**AI Dataset Curation**
+### AI Dataset Curation
 
 AI thrives on clean, standardized datasets. Remix facilitates the creation of those datasets by forcing you to define data models in a standardized way.
 
 Once you've defined those models, Remix replicates data (which conforms to those models) to any number of storage systems. Depending on your needs, you might replicate data to traditional databases, a data warehouse, vector databases, or even systems used to serve large-scale AI training runs like VAST, Databricks, or S3.
 
-**Canonical Data Model Enforcement**
+### Canonical Data Model Enforcement
 
 Models and remixing logic are defined with [JSON Schema](https://json-schema.org) and YAML, respectively. This declarative nature makes it easy to keep your models and transformation logic in source control, such as Github, and works great with automated deployment systems like Terraform or Ansible.
 
@@ -35,7 +35,7 @@ JSON Schema is the most widely accepted format for defining shared, canonical da
 
 We use JSON Schema to validate models in Remix because (1) of course there is already a [high-quality tool](https://github.com/santhosh-tekuri/jsonschema) to do that and (2) the format's portability enables you to re-use those models in other systems.
 
-## Replication Algorithm Summary
+### Replication Algorithm Summary
 
 1. Watch (or listen) for data changes by querying [change data capture](https://en.wikipedia.org/wiki/Change_data_capture) (CDC) endpoints, or receiving [webhooks](https://en.wikipedia.org/wiki/Webhook) on an API endpoint.
 2. "Remixing" the data that comes in from those sources into predefined models (defined via [JSON Schema](https://json-schema.org)), and placing those validated model objects in a queue, or some fast external data storage system, like Redis.
