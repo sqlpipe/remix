@@ -24,7 +24,7 @@ func createPostgresqlProductsTable(t *testing.T, db *sql.DB) {
 			   CREATE TABLE products (
 					   id bigserial PRIMARY KEY,
 					   stripe_id TEXT UNIQUE,
-					   name TEXT NOT NULL,
+					   product_name TEXT NOT NULL,
 					   active BOOLEAN DEFAULT TRUE,
 					   price int,
 					   created TIMESTAMPTZ,

@@ -1,0 +1,35 @@
+prod-db:
+  type: "postgresql"
+  dsn: "DSN GOES HERE"
+  replication_dsn: "DSN FOR CDC CONNECTION GOES HERE"
+  max_open_connections: 10
+  max_idle_connections: 10
+  max_connection_idle_time: 30s
+  rate_limit: 10
+  rate_bucket_size: 100
+
+  receive_router:
+    public.products:
+      product:
+        id:
+          field: id
+        stripe_id:
+          field: stripe_id
+        product_name:
+          field: name
+        price:
+          field: price
+
+  push_router:
+    product:
+      public.products:
+        id:
+          field: id
+          search_key: true
+        stripe_id:
+          field: stripe_id
+          search_key: true
+        name:
+          field: product_name
+        price:
+          field: price

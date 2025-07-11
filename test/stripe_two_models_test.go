@@ -23,7 +23,7 @@ func createPostgresqlProductsAndPricesTables(t *testing.T, db *sql.DB) {
 	_, err := db.Exec(`
 			   CREATE TABLE products (
 					   id TEXT PRIMARY KEY,
-					   name TEXT NOT NULL,
+					   product_name TEXT NOT NULL,
 					   default_price_id TEXT UNIQUE,
 					   active BOOLEAN DEFAULT TRUE,
 					   created TIMESTAMPTZ,

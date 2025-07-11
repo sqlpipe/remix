@@ -1,0 +1,18 @@
+{
+    "title": "product",
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": ["number", "null", "string"]
+        },
+        "stripe_id": {
+            "type": ["string", "null"]
+        },
+        "name": {
+            "type": "string"
+        },
+        "price": {
+            "type": ["number", "null"]
+        }
+    }
+}

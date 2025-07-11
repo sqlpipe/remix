@@ -1,0 +1,54 @@
+prod-db:
+  type: "postgresql"
+  dsn: "DSN GOES HERE"
+  replication_dsn: "DSN FOR CDC CONNECTION GOES HERE"
+  max_open_connections: 10
+  max_idle_connections: 10
+  max_connection_idle_time: 30s
+  rate_limit: 10
+  rate_bucket_size: 100
+
+  receive_router:
+
+    public.products:
+      product:
+        id:
+          field: id
+        product_name:
+          field: name
+        default_price_id:
+          field: default_price_id
+
+    public.prices:
+      price:
+        id:
+          field: id
+        product_id:
+          field: product_id
+        unit_amount:
+          field: unit_amount
+        currency:
+          field: currency
+
+  push_router:
+    product:
+      public.products:
+        id:
+          field: id
+          search_key: true
+        name:
+          field: product_name
+        default_price_id:
+          field: default_price_id
+    
+    price:
+      public.prices:
+        id:
+          search_key: true
+          field: id
+        product_id:
+          field: product_id
+        unit_amount:
+          field: unit_amount
+        currency:
+          field: currency

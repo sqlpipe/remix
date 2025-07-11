@@ -1,0 +1,52 @@
+payment-gateway:
+  type: "stripe"
+  use_cli_listener: true
+  api_key: "API_KEY_GOES_HERE"
+  rate_limit: 10
+  rate_bucket_size: 100
+
+  receive_router:
+    product:
+      product:
+        id:
+          field: id
+        name:
+          field: name
+        default_price:
+          field: default_price_id
+
+    price:
+      price:
+        id:
+          field: id
+        product:
+          field: product_id
+        unit_amount:
+          field: unit_amount
+        currency:
+          field: currency
+    
+  push_router:
+
+    product:
+      products:
+        id:
+          field: id
+          search_key: true
+        name:
+          field: name
+        default_price_id:
+          field: default_price
+    
+    price:
+      prices:
+        id:
+          field: id
+        product_id:
+          field: product
+        unit_amount:
+          field: unit_amount
+        currency:
+          field: currency
+
+          
