@@ -37,9 +37,9 @@ type Field struct {
 
 type PullObject map[string]Field
 type PullLocation map[string]PullObject
-type ReceiveRouter map[string]PullLocation
+type ReceiveMixer map[string]PullLocation
 
-type PushRouter map[string]PushObject
+type PushMixer map[string]PushObject
 type PushObject map[string]PushLocation
 type PushLocation map[string]Field
 
@@ -62,8 +62,8 @@ type SystemInfo struct {
 	RateLimit          int           `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
 	RateBucketSize     int           `yaml:"rate_bucket_size,omitempty" json:"rate_bucket_size,omitempty"`
 	UseCliListener     bool          `yaml:"use_cli_listener,omitempty" json:"use_cli_listener,omitempty"`
-	ReceiveRouter      ReceiveRouter `yaml:"receive_router,omitempty" json:"receive_router,omitempty"`
-	PushRouter         PushRouter    `yaml:"push_router,omitempty" json:"push_router,omitempty"`
+	ReceiveMixer       ReceiveMixer  `yaml:"receive_mixer,omitempty" json:"receive_mixer,omitempty"`
+	PushMixer          PushMixer     `yaml:"push_mixer,omitempty" json:"push_mixer,omitempty"`
 }
 
 type SystemInterface interface {

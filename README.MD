@@ -86,7 +86,7 @@ As of right now, it keeps active, validated objects in a queue in RAM. There are
 - The ability to write objects to disk, thus making a single-node system resilient to hardware failures.
 - The ability to offload storage to Redis, thus making a distributed setup quite easy. At that point, you will be able to drop Remix into Kubernetes, scale the amount of nodes up and down according to your compute needs, and have them cooperate using Redis as a central communication hub.
 
-## Understand Remix
+## Understanding Remix
 
 Remix requires you to understand its declarative data mapping paradigm. This takes a few minutes, and is best explained in combination with an example.
 
@@ -284,7 +284,7 @@ payment-gateway:
   rate_limit: 10
   rate_bucket_size: 100
 
-  receive_router:
+  receive_mixer:
     product:
       product:
           id:
@@ -300,7 +300,7 @@ payment-gateway:
         unit_amount:
           field: price
     
-  push_router:
+  push_mixer:
     product:
       products:
         id:
@@ -314,7 +314,7 @@ payment-gateway:
 
 Here, once again we are doing a bit of config at the top of the file. API key, rate limit, etc. One cool feature is that Remix can use the Stripe CLI to forward all webhooks to a locally running API endpoint, negating the need for you to set up and maintain an external URL. Just set `use_cli_listener: true` in the YAML file.
 
-In the case of Stripe, we don't watch a certain location for changes. Instead they are pushed to us via POST request. The two keys `product` and `price`, both on the first level below `receive_router`, correspond to the *object type* that was pushed to us. This means that Remix will listen for both `product` and `price` objects. Remember that Stripe does not allow you to store price data in an object itself - you must create separate price objects. This allows us to keep our prices and products synced across our database and Stripe, despite differing data models!
+In the case of Stripe, we don't watch a certain location for changes. Instead they are pushed to us via POST request. The two keys `product` and `price`, both on the first level below `receive_mixer`, correspond to the *object type* that was pushed to us. This means that Remix will listen for both `product` and `price` objects. Remember that Stripe does not allow you to store price data in an object itself - you must create separate price objects. This allows us to keep our prices and products synced across our database and Stripe, despite differing data models!
 
 Another thing of note is that while Remix does not allow nested data structures in your schema models, it *can* accept and push nested objects. Notice the `metadata.id` field being received in the receive router, and the `metadata[id]` field in the push router. Stripe allows you to store arbitrary metadata in an object payload, so here we are storing our auto-incrementing integer ID from our database in Stripe!
 
@@ -334,3 +334,62 @@ In plain english, it will create a product object whenever it receives a price o
 Phew! With all that in mind, it's time to start Remix.
 
 ## Installing And Running Remix
+
+Let's go through a hello world startup example. You'll need Docker running locally, and a Stripe sandbox API key. We're going to two way sync a table called `products` from PostgreSQL to Stripe.
+
+First, check out this repo, go to the repo's root, and run the following commands, one by one, to set up PostgreSQL with CDC, and a single "products" table.
+
+```
+# Build the image (one time)
+docker build -t my-postgres:15 -f ./postgresql.dockerfile ./examples
+
+# Run Postgres with logical replication & wal2json
+docker run --rm -d \
+  --name test-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=Mypass123 \
+  -e POSTGRES_DB=postgres \
+  -p 5432:5432 \
+  my-postgres:15 \
+  postgres -c wal_level=logical -c max_replication_slots=5 -c max_wal_senders=5 -c max_connections=100
+
+# Create products table and publication (wait a sec for DB to start)
+docker exec -i test-postgres psql -U postgres -d postgres <<'EOF'
+CREATE TABLE IF NOT EXISTS products (
+    id bigserial PRIMARY KEY,
+    stripe_id TEXT UNIQUE,
+    product_name TEXT NOT NULL,
+    active BOOLEAN DEFAULT TRUE,
+    price int,
+    created TIMESTAMPTZ,
+    updated TIMESTAMPTZ,
+    description TEXT,
+    livemode BOOLEAN DEFAULT FALSE,
+    statement_descriptor TEXT,
+    unit_label TEXT,
+    category TEXT,
+    internal_notes TEXT
+);
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'my_pub') THEN
+        CREATE PUBLICATION my_pub FOR ALL TABLES;
+    END IF;
+END
+$$;
+EOF
+```
+
+Next, go to the Stripe dashboard and create a sandbox. In the "Home" section of the sandbox, on the right, there should be a section called "API keys" (at least that's where there are as of time of writing). You want the "Secret key". It should look something like `sk_test_45Wf3E...`.
+
+Once you've got that, it's time to create the system remix files, and the model file.
+
+```
+docker run \
+    -v $(pwd)/examples/stripe_postgresql_one_table/systems:/systems \
+    -v $(pwd)/examples/stripe_postgresql_one_table/models:/models \
+    -e SYSTEMS_DIR=/systems \
+    -e MODELS_DIR=/models \
+    --name remix \
+    sqlpipe/remix:latest
+```

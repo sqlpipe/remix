@@ -1,0 +1,15 @@
+{
+    "title": "product",
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": ["string", "null"]
+        },
+        "name": {
+            "type": "string"
+        },
+        "default_price_id": {
+            "type": ["string", "null"]
+        }
+    }
+}

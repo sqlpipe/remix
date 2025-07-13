@@ -41,12 +41,16 @@ type Postgresql struct {
 func (app *application) newPostgresql(systemInfo SystemInfo, duplicateChecker map[string][]ExpiringObject) (postgresql Postgresql, err error) {
 	db, err := openConnectionPool(systemInfo.Name, systemInfo.ConnectionString, DriverPostgreSQL)
 	if err != nil {
+		app.logger.Error("error opening PostgreSQL connection", "error", err, "system", systemInfo.Name)
 		return postgresql, fmt.Errorf("error opening postgresql db :: %v", err)
 	}
+
+	app.logger.Info("PostgreSQL connection established", "system", systemInfo.Name)
 
 	// Create replication connection
 	replConn, err := pgconn.Connect(context.Background(), systemInfo.ReplicationDsn)
 	if err != nil {
+		app.logger.Error("error opening PostgreSQL replication connection", "error", err, "system", systemInfo.Name)
 		return postgresql, fmt.Errorf("error opening postgresql replication connection :: %v", err)
 	}
 
@@ -59,13 +63,53 @@ func (app *application) newPostgresql(systemInfo SystemInfo, duplicateChecker ma
 
 	app.storageEngine.setSafeIndexMap(systemInfo.Name, 0)
 
-	go postgresql.watchQueue()
-	go postgresql.watchCDC()
+	go postgresql.loop()
+	// go postgresql.watchCDC()
 
 	return postgresql, nil
 }
 
-func (p Postgresql) watchQueue() {
+func (p Postgresql) loop() {
+
+	slotName := "sqlpipe_slot"
+	outputPlugin := "wal2json"
+
+	replConn, err := pgconn.Connect(context.Background(), p.systemInfo.ReplicationDsn)
+	if err != nil {
+		p.app.logger.Error("failed to connect", "error", err)
+		os.Exit(1)
+	}
+	defer replConn.Close(context.Background())
+
+	sysident, err := pglogrepl.IdentifySystem(context.Background(), replConn)
+	if err != nil {
+		p.app.logger.Error("IdentifySystem failed", "error", err)
+		os.Exit(1)
+	}
+
+	_, err = pglogrepl.CreateReplicationSlot(context.Background(), replConn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Temporary: false, Mode: pglogrepl.LogicalReplication})
+	if err != nil {
+		// If the error is "already exists", it's OK, otherwise fail
+		if !strings.Contains(err.Error(), "already exists") {
+			p.app.logger.Error("CreateReplicationSlot failed", "error", err)
+			os.Exit(1)
+		}
+	}
+
+	pluginArguments := []string{"\"pretty-print\" 'true'"}
+	err = pglogrepl.StartReplication(context.Background(), replConn, slotName, sysident.XLogPos,
+		pglogrepl.StartReplicationOptions{
+			PluginArgs: pluginArguments,
+		})
+	if err != nil {
+		p.app.logger.Error("StartReplication failed", "error", err)
+		os.Exit(1)
+	}
+
+	clientXLogPos := sysident.XLogPos
+	standbyMessageTimeout := time.Second * 10
+	nextStandbyMessageDeadline := time.Now().Add(standbyMessageTimeout)
+
 	var index int64
 	for {
 		// Get the last safe object index for this system
@@ -90,13 +134,23 @@ func (p Postgresql) watchQueue() {
 		}
 
 		for _, object := range objects {
+
+			if p.app.config.debug {
+				b, _ := json.MarshalIndent(object, "", "  ")
+				fmt.Printf("PostgreSQL got from queue: %s\n", string(b))
+			}
+
 			searchFields := []string{}
 
-			for locationInSystem, fields := range p.systemInfo.PushRouter[object.Type] {
-				newObj := map[string]any{}
+			for locationInSystem, fields := range p.systemInfo.PushMixer[object.Type] {
+				newObj := Object{
+					Operation: object.Operation,
+					Type:      object.Type,
+					Payload:   make(map[string]any),
+				}
 				for keyInSchema, location := range fields {
 					if _, ok := object.Payload[keyInSchema]; ok {
-						newObj[location.Field] = object.Payload[keyInSchema]
+						newObj.Payload[location.Field] = object.Payload[keyInSchema]
 
 						if fields[keyInSchema].SearchKey {
 							searchFields = append(searchFields, location.Field)
@@ -110,14 +164,18 @@ func (p Postgresql) watchQueue() {
 
 					objectIsDuplicate = true
 
-					for k, v := range newObj {
-						if _, ok := expiringObj.Object.Payload[k]; !ok {
-							objectIsDuplicate = false
-							break
-						}
-						if v != expiringObj.Object.Payload[k] {
-							objectIsDuplicate = false
-							break
+					if expiringObj.Object.Operation != object.Operation {
+						objectIsDuplicate = false
+					} else {
+						for k, v := range newObj.Payload {
+							if _, ok := expiringObj.Object.Payload[k]; !ok {
+								objectIsDuplicate = false
+								break
+							}
+							if v != expiringObj.Object.Payload[k] {
+								objectIsDuplicate = false
+								break
+							}
 						}
 					}
 
@@ -129,15 +187,19 @@ func (p Postgresql) watchQueue() {
 					}
 				}
 
+				if p.app.config.debug {
+					fmt.Printf("PostgreSQL duplicate check result: %v, object: %+v\n", objectIsDuplicate, newObj)
+				}
+
 				if !foundDuplicate {
-					switch object.Operation {
+					switch newObj.Operation {
 					case "upsert":
-						err = p.upsertJSON(object.Payload, searchFields, locationInSystem, object.Type)
+						err = p.upsertJSON(newObj.Payload, searchFields, locationInSystem, newObj.Type, &object)
 						if err != nil {
-							p.app.logger.Error("error upserting JSON to PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", newObj)
+							p.app.logger.Error("error upserting JSON to PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", object)
 						}
 					case "delete":
-						err = p.deleteFromPostgresql(object.Payload, searchFields, locationInSystem)
+						err = p.deleteFromPostgresql(newObj.Payload, searchFields, locationInSystem, &object)
 						if err != nil {
 							p.app.logger.Error("error deleting from PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", newObj)
 						}
@@ -149,6 +211,65 @@ func (p Postgresql) watchQueue() {
 
 		// Update the safe index map for this system
 		p.app.storageEngine.setSafeIndexMap(p.systemInfo.Name, index)
+
+		if time.Now().After(nextStandbyMessageDeadline) {
+			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), replConn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
+			if err != nil {
+				log.Fatalln("SendStandbyStatusUpdate failed:", err)
+			}
+			nextStandbyMessageDeadline = time.Now().Add(standbyMessageTimeout)
+		}
+
+		ctx, cancel := context.WithDeadline(context.Background(), nextStandbyMessageDeadline)
+		rawMsg, err := replConn.ReceiveMessage(ctx)
+		cancel()
+		if err != nil {
+			if pgconn.Timeout(err) {
+				continue
+			}
+			log.Fatalln("ReceiveMessage failed:", err)
+		}
+
+		if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
+			log.Fatalf("received Postgres WAL error: %+v", errMsg)
+		}
+
+		msg, ok := rawMsg.(*pgproto3.CopyData)
+		if !ok {
+			log.Printf("Received unexpected message: %T\n", rawMsg)
+			continue
+		}
+
+		switch msg.Data[0] {
+		case pglogrepl.PrimaryKeepaliveMessageByteID:
+			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+			if err != nil {
+				log.Fatalln("ParsePrimaryKeepaliveMessage failed:", err)
+			}
+			if pkm.ServerWALEnd > clientXLogPos {
+				clientXLogPos = pkm.ServerWALEnd
+			}
+			if pkm.ReplyRequested {
+				nextStandbyMessageDeadline = time.Time{}
+			}
+
+		case pglogrepl.XLogDataByteID:
+			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
+			if err != nil {
+				log.Fatalln("ParseXLogData failed:", err)
+			}
+
+			err = p.handleCdcEvent(string(xld.WALData))
+			if err != nil {
+				p.app.logger.Error("error handling CDC event", "error", err, "data", string(xld.WALData))
+				return
+			}
+
+			if xld.WALStart > clientXLogPos {
+				clientXLogPos = xld.WALStart
+			}
+		default:
+		}
 	}
 }
 
@@ -156,7 +277,13 @@ func (p Postgresql) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	p.app.logger.Error("PostgreSQL does not support webhooks", "system", p.systemInfo.Name)
 }
 
-func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locationInSystem string, objectType string) error {
+func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locationInSystem string, objectType string, originalObj *Object) error {
+
+	if p.app.config.debug {
+		b, _ := json.MarshalIndent(data, "", "  ")
+		fmt.Printf("Upserting to PostgreSQL: %s\n", string(b))
+	}
+
 	var foundMatch bool
 	var conflictField string
 	var conflictValue any
@@ -236,13 +363,18 @@ func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locat
 		}
 	}
 
-	object := Object{
-		Type:    objectType,
-		Payload: data,
-	}
+	// object := Object{
+	// 	Type:    objectType,
+	// 	Payload: data,
+	// }
 
-	expiringObj := newExpiringObject(object, p.app.config.keepDuplicatesFor)
+	expiringObj := newExpiringObject(*originalObj, p.app.config.keepDuplicatesFor)
 	p.duplicateChecker[objectType] = append(p.duplicateChecker[objectType], expiringObj)
+
+	if p.app.config.debug {
+		b, _ := json.MarshalIndent(originalObj, "", "  ")
+		fmt.Printf("PostgreSQL added to duplicate checker: %v\n", string(b))
+	}
 
 	return nil
 }
@@ -377,6 +509,10 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 		return fmt.Errorf("error unmarshalling CDC event: %v", err)
 	}
 
+	if p.app.config.debug {
+		fmt.Printf("PostgreSQL received CDC event: %s\n", jsonString)
+	}
+
 	for _, change := range event.Change {
 		pullLocation := change.Schema + "." + change.Table
 		operationType := change.Kind
@@ -403,7 +539,7 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 			return fmt.Errorf("unknown operation type: %s", operationType)
 		}
 
-		for objectType, pullObject := range p.systemInfo.ReceiveRouter[pullLocation] {
+		for objectType, pullObject := range p.systemInfo.ReceiveMixer[pullLocation] {
 			newObj := map[string]any{}
 
 			for keyInObj, fields := range pullObject {
@@ -437,10 +573,23 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 
 				objectIsDuplicate = true
 
-				for k, v := range obj {
-					if v != expiringObj.Object.Payload[k] {
-						objectIsDuplicate = false
-						break
+				if expiringObj.Object.Operation != operationType {
+					objectIsDuplicate = false
+				} else {
+					if operationType == "delete" {
+						for k, v := range obj {
+							if v != expiringObj.Object.Payload[k] {
+								objectIsDuplicate = false
+								break
+							}
+						}
+					} else if operationType == "upsert" {
+						for k, v := range expiringObj.Object.Payload {
+							if v != obj[k] {
+								objectIsDuplicate = false
+								break
+							}
+						}
 					}
 				}
 
@@ -450,6 +599,10 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 					foundDuplicate = true
 					break
 				}
+			}
+
+			if p.app.config.debug {
+				fmt.Printf("PostgreSQL duplicate check result: %v, object: %+v\n", objectIsDuplicate, obj)
 			}
 
 			if !foundDuplicate {
@@ -465,6 +618,10 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 
 				expiringObj := newExpiringObject(object, p.app.config.keepDuplicatesFor)
 				p.duplicateChecker[schemaName] = append(p.duplicateChecker[schemaName], expiringObj)
+
+				if p.app.config.debug {
+					fmt.Printf("PostgreSQL added to queue and duplicate checker: %v\n", object)
+				}
 			}
 		}
 	}
@@ -473,7 +630,13 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 }
 
 // deleteFromPostgresql deletes a row from PostgreSQL based on the searchFields and payload.
-func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []string, locationInSystem string) error {
+func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []string, locationInSystem string, originalObj *Object) error {
+
+	if p.app.config.debug {
+		b, _ := json.MarshalIndent(payload, "", "  ")
+		fmt.Printf("Deleting from PostgreSQL: %s\n", string(b))
+	}
+
 	if len(searchFields) == 0 {
 		return fmt.Errorf("no search fields provided for delete operation")
 	}
@@ -497,5 +660,14 @@ func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []
 		p.app.logger.Error("error executing delete query", "error", err, "query", deleteQuery, "values", values)
 		return fmt.Errorf("error executing delete query: %v", err)
 	}
+
+	expiringObj := newExpiringObject(*originalObj, p.app.config.keepDuplicatesFor)
+	p.duplicateChecker[originalObj.Type] = append(p.duplicateChecker[originalObj.Type], expiringObj)
+
+	if p.app.config.debug {
+		b, _ := json.MarshalIndent(originalObj, "", "  ")
+		fmt.Printf("PostgreSQL added to duplicate checker: %v\n", string(b))
+	}
+
 	return nil
 }

@@ -32,6 +32,7 @@ type config struct {
 	systemsDir        string
 	modelsDir         string
 	keepDuplicatesFor time.Duration
+	debug             bool
 }
 
 type application struct {
@@ -51,6 +52,7 @@ func main() {
 	flag.StringVar(&cfg.systemsDir, "systems-dir", "./systems", "Directory for systems configuration")
 	flag.StringVar(&cfg.modelsDir, "models-dir", "./models", "Directory for models configuration")
 	flag.DurationVar(&cfg.keepDuplicatesFor, "keep-duplicates-for", 1*time.Hour, "Duration to keep duplicate entries")
+	flag.BoolVar(&cfg.debug, "debug", false, "Enable debug mode - prints key information to stdout")
 	displayVersion := flag.Bool("version", false, "Display version and exit")
 
 	flag.Parse()
@@ -80,6 +82,18 @@ func main() {
 	if err != nil {
 		logger.Error("failed to load system configurations", "error", err)
 		os.Exit(1)
+	}
+
+	fmt.Printf("%+v", cfg)
+
+	if cfg.debug {
+		b, err := json.MarshalIndent(systemInfoMap, "", "  ")
+		if err != nil {
+			logger.Error("failed to marshal system info map", "error", err)
+			os.Exit(1)
+		}
+		fmt.Println("System Info Map:")
+		fmt.Println(string(b))
 	}
 
 	storageEngine, err := newStorageEngine()

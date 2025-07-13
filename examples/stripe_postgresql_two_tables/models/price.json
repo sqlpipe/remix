@@ -1,0 +1,18 @@
+{
+    "title": "price",
+    "type": "object",
+    "properties": {
+        "id": {
+            "type": ["string", "null"]
+        },
+        "product_id": {
+            "type": ["string", "null"]
+        },
+        "unit_amount": {
+            "type": "number"
+        },
+        "currency": {
+            "type": "string"
+        }
+    }
+}

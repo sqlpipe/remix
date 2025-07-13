@@ -1,14 +1,14 @@
 prod-db:
   type: "postgresql"
-  dsn: "DSN GOES HERE"
-  replication_dsn: "DSN FOR CDC CONNECTION GOES HERE"
+  dsn: "DSN_HERE"
+  replication_dsn: "REPLICATION_DSN_HERE"
   max_open_connections: 10
   max_idle_connections: 10
   max_connection_idle_time: 30s
   rate_limit: 10
   rate_bucket_size: 100
 
-  receive_router:
+  receive_mixer:
     public.products:
       product:
         id:
@@ -20,7 +20,7 @@ prod-db:
         price:
           field: price
 
-  push_router:
+  push_mixer:
     product:
       public.products:
         id:

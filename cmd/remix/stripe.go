@@ -22,6 +22,11 @@ func (s Stripe) deleteFromStripe(endpoint string, object Object, searchKey, sear
 		return fmt.Errorf("deleteFromStripe: searchKey and searchValue must be provided")
 	}
 
+	if s.app.config.debug {
+		b, _ := json.MarshalIndent(object, "", "  ")
+		fmt.Printf("Stripe deleting object: %s\n", string(b))
+	}
+
 	baseURL := "https://api.stripe.com/v1"
 	deleteUrl := fmt.Sprintf("%s/%s/%s", baseURL, endpoint, searchValue)
 	req, err := http.NewRequest("DELETE", deleteUrl, nil)
@@ -146,7 +151,12 @@ func (s Stripe) watchQueue() {
 			var searchKey string
 			var searchValue string
 
-			for locationInSystem, pushLocation := range s.systemInfo.PushRouter[object.Type] {
+			if s.app.config.debug {
+				b, _ := json.MarshalIndent(object, "", "  ")
+				fmt.Printf("Stripe got object from queue: %s\n", string(b))
+			}
+
+			for locationInSystem, pushLocation := range s.systemInfo.PushMixer[object.Type] {
 				newObj := Object{
 					Payload:   make(map[string]any),
 					Operation: object.Operation,
@@ -185,6 +195,10 @@ func (s Stripe) watchQueue() {
 					}
 				}
 
+				if s.app.config.debug {
+					fmt.Printf("Stripe duplicate check result: %v, object: %+v\n", objectIsDuplicate, newObj)
+				}
+
 				if !foundDuplicate {
 					switch object.Operation {
 					case "upsert":
@@ -213,6 +227,11 @@ func (s Stripe) watchQueue() {
 func (s Stripe) upsertObject(endpoint string, object Object, objectType string, searchKey, searchValue string) ([]byte, error) {
 	// Replace with your actual secret key or use an environment variable
 	form := url.Values{}
+
+	if s.app.config.debug {
+		b, _ := json.MarshalIndent(object, "", "  ")
+		fmt.Printf("Stripe upserting object: %s\n", string(b))
+	}
 
 	for key, value := range object.Payload {
 
@@ -298,10 +317,16 @@ func (s Stripe) upsertObject(endpoint string, object Object, objectType string, 
 	expiringObj := newExpiringObject(object, s.app.config.keepDuplicatesFor)
 	s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], expiringObj)
 
+	if s.app.config.debug {
+		b, _ := json.MarshalIndent(object, "", "  ")
+		fmt.Printf("Stripe added to queue and duplicate checker: %s\n", string(b))
+	}
+
 	return body, nil
 }
 
 func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
+
 	// Immediately acknowledge receipt to Stripe
 	w.WriteHeader(http.StatusOK)
 	var err error
@@ -310,6 +335,10 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
 		s.app.logger.Error("Failed to decode Stripe event", "error", err)
 		return
+	}
+
+	if s.app.config.debug {
+		s.app.logger.Info("Received Stripe event", "event_type", event.Type)
 	}
 
 	objectName := string(event.Type)
@@ -337,9 +366,14 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.app.config.debug {
+		b, _ := json.MarshalIndent(obj, "", "  ")
+		fmt.Printf("Stripe received object: %s\n", string(b))
+	}
+
 	newObjs := make(map[string]map[string]any)
 
-	for schemaName, fields := range s.systemInfo.ReceiveRouter[objectName] {
+	for schemaName, fields := range s.systemInfo.ReceiveMixer[objectName] {
 		newModel := map[string]any{}
 
 		for keyInObj, field := range fields {
@@ -387,11 +421,16 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if objectIsDuplicate {
+
 				// If we found a duplicate, we can remove it from the duplicate checker
 				s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName][:i], s.duplicateChecker[schemaName][i+1:]...)
 				foundDuplicate = true
 				break
 			}
+		}
+
+		if s.app.config.debug {
+			fmt.Printf("Stripe duplicate check result: %v, object: %+v\n", objectIsDuplicate, obj)
 		}
 
 		if !foundDuplicate {
@@ -401,9 +440,14 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 				Operation: operationType,
 				Payload:   obj,
 			}
+
 			s.app.storageEngine.addSafeObject(object)
 			expiringObj := newExpiringObject(object, s.app.config.keepDuplicatesFor)
 			s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName], expiringObj)
+
+			if s.app.config.debug {
+				fmt.Printf("Stripe added to queue and duplicate checker: %+v\n", object)
+			}
 		}
 	}
 }

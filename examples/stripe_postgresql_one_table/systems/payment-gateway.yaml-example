@@ -1,11 +1,11 @@
 payment-gateway:
   type: "stripe"
   use_cli_listener: true
-  api_key: "API_KEY_GOES_HERE"
+  api_key: "API_KEY_HERE"
   rate_limit: 10
   rate_bucket_size: 100
 
-  receive_router:
+  receive_mixer:
     product:
       product:
           id:
@@ -21,7 +21,7 @@ payment-gateway:
         unit_amount:
           field: price
     
-  push_router:
+  push_mixer:
     product:
       products:
         id:

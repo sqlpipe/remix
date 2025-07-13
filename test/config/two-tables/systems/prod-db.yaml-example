@@ -8,7 +8,7 @@ prod-db:
   rate_limit: 10
   rate_bucket_size: 100
 
-  receive_router:
+  receive_mixer:
 
     public.products:
       product:
@@ -30,7 +30,7 @@ prod-db:
         currency:
           field: currency
 
-  push_router:
+  push_mixer:
     product:
       public.products:
         id:

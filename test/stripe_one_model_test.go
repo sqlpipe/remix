@@ -195,6 +195,7 @@ func TestOneTableStreaming(t *testing.T) {
 			"PORT=4000",
 			"SYSTEMS_DIR=/config/one-table/systems",
 			"MODELS_DIR=/config/one-table/models",
+			"DEBUG=true",
 		},
 		Mounts: []string{
 			fmt.Sprintf("%s:/config/one-table/systems", systemsHostDir),
@@ -245,9 +246,6 @@ func TestOneTableStreaming(t *testing.T) {
 	}
 
 	fmt.Println("SQLpipe is running and healthy!")
-
-	// stripeCmd := exec.Command("stripe", "trigger", "price.created")
-	// stripeCmd := exec.Command("stripe", "trigger", "tax_rate.created")
 
 	time.Sleep(1 * time.Second)
 

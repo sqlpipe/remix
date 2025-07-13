@@ -15,60 +15,6 @@ confirm:
 	@echo -n 'Are you sure? [y/N] ' && read ans && [ $${ans:-N} = y ]
 
 # ==================================================================================== #
-# DEVELOPMENT
-# ==================================================================================== #
-
-## sqlpipe: run the cmd/sqlpipe application
-.PHONY: sqlpipe
-sqlpipe: build/sqlpipe
-	docker rm -f sqlpipe
-	docker-compose up --build -d sqlpipe
-	docker-compose logs -f sqlpipe
-
-.PHONY: run
-run: build/sqlpipe
-	./bin/sqlpipe
-
-## compose-reset: run docker-compose
-.PHONY: compose
-compose: build/sqlpipe
-	docker-compose down -v
-	docker-compose up --build -d
-	docker-compose logs -f
-
-## postgresql: run postgresql
-.PHONY: postgresql
-postgresql:
-	docker compose down postgresql
-	docker compose up -d postgresql
-	clear
-	docker compose logs -f postgresql
-
-## mssql: run mssql
-.PHONY: mssql
-mssql:
-	docker compose down mssql
-	docker compose up -d mssql
-	clear
-	docker compose logs -f mssql
-
-## mysql: run mysql
-.PHONY: mysql
-mysql:
-	docker compose down mysql
-	docker compose up -d mysql
-	clear
-	docker compose logs -f mysql
-
-## oracle: run oracle
-.PHONY: oracle
-oracle:
-	docker compose down oracle
-	docker compose up -d oracle
-	clear
-	docker compose logs -f oracle
-
-# ==================================================================================== #
 # QUALITY CONTROL
 # ==================================================================================== #
 
@@ -96,22 +42,22 @@ vendor:
 # BUILD
 # ==================================================================================== #
 
-## build/sqlpipe: build the cmd/sqlpipe application
-.PHONY: build/sqlpipe
-build/sqlpipe:
-	@echo 'Building cmd/sqlpipe...'
-	GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o=./bin/sqlpipe ./cmd/sqlpipe
-	# go build -ldflags="-w -s" -o=./bin/sqlpipe ./cmd/sqlpipe
+## build/remix: build the cmd/remix application
+.PHONY: build/remix
+build/remix:
+	@echo 'Building cmd/remix...'
+	GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o=./bin/remix ./cmd/remix
+	# go build -ldflags="-w -s" -o=./bin/remix ./cmd/remix
 
-## build/docker: build the cmd/sqlpipe docker image and push
+## build/docker: build the cmd/remix docker image and push
 .PHONY: build/docker
 build/docker:
-	@echo 'Building cmd/sqlpipe...'
-	GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o=./bin/sqlpipe ./cmd/sqlpipe
+	@echo 'Building cmd/remix...'
+	GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o=./bin/remix ./cmd/remix
 	@echo 'Building docker image...'
-	docker buildx build --platform linux/amd64 -t sqlpipe/sqlpipe:latest -f sqlpipe.dockerfile . --load
+	docker buildx build --platform linux/amd64 -t sqlpipe/remix:latest -f dockerfile . --load
 	@echo 'Pushing docker image...'
-	docker push sqlpipe/sqlpipe:latest
+	docker push sqlpipe/remix:latest
 
 ## test: run tests in the /test directory
 .PHONY: test

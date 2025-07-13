@@ -5,5 +5,6 @@ bin/*
 .hidden
 */.DS_Store
 cmd/remix/sample.yaml
-*-ignore.yaml
+*-ignore.*
 gitleaks-report.json
+blog-post/
