@@ -84,8 +84,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("%+v", cfg)
-
 	if cfg.debug {
 		b, err := json.MarshalIndent(systemInfoMap, "", "  ")
 		if err != nil {

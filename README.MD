@@ -45,7 +45,7 @@ We use JSON Schema to validate models in Remix because (1) of course there is al
 
 Remix is a new tool and is being actively developed.
 
-Would you like a certain integration or feature built? SQLpipe, the company behind Remix, offers [service packages]() that allow you to influence the roadmap. Turnaround time can be as fast as a few weeks.
+Would you like a certain integration or feature built? SQLpipe, the company behind Remix, offers [service packages](https://www.sqlpipe.com/services/remix-support) that allow you to influence the roadmap. Turnaround time can be as fast as a few weeks.
 
 ### Supported Integrations
 
@@ -233,7 +233,7 @@ Below is a definition of how receive mixers and push mixers are defined, with th
 
 ### Mixer definition
 
-```YAML
+```yaml
 receive_mixer:
     {location_in_system}:
         [model_title]:
@@ -339,7 +339,7 @@ Let's go through a hello world startup example. You'll need Docker running local
 
 First, check out this repo, go to the repo's root, and run the following commands, one by one, to set up PostgreSQL with CDC, and a single "products" table.
 
-```
+```bash
 # Build the image (one time)
 docker build -t my-postgres:15 -f ./postgresql.dockerfile ./examples
 
@@ -384,7 +384,11 @@ Next, go to the Stripe dashboard and create a sandbox. In the "Home" section of 
 
 Once you've got that, it's time to create the system remix files, and the model file.
 
-```
+If you'd like a step-by-step walkthrough creating those files, starting the program, and proving replication, visit our [Stripe <> PostgreSQL replication guide](https://www.sqlpipe.com/blog/stripe-postgresql-data-sync-with-remix).
+
+Here is an example startup command:
+
+```bash
 docker run \
     -v $(pwd)/examples/stripe_postgresql_one_table/systems:/systems \
     -v $(pwd)/examples/stripe_postgresql_one_table/models:/models \
