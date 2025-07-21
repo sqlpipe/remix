@@ -8,6 +8,8 @@ Remix is a free, open-source data streaming solution, written in Golang. It has 
 
 **If you find Remix helpful, please consider starring the repo ⭐️ to support the project and help others discover it!**
 
+[Remix is announced at Stripe's headquarters in Dublin](https://youtu.be/_HKp-pvk58U).
+
 ### Data Replication
 
 Remix features a "fan-in, fan-out" architecture when replicating data. It pulls in data, transforms it to fit into predefined models that you define, and puts objects in a queue. Then, for each system that you want to push to, it transforms the objects to a format that the target system will accept, and pushes to it.
