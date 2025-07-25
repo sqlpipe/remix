@@ -135,10 +135,8 @@ func (p Postgresql) loop() {
 
 		for _, object := range objects {
 
-			if p.app.config.debug {
-				b, _ := json.MarshalIndent(object, "", "  ")
-				fmt.Printf("PostgreSQL got from queue: %s\n", string(b))
-			}
+			b, _ := json.MarshalIndent(object, "", "  ")
+			p.app.logger.Debug("PostgreSQL got from queue", "object", string(b))
 
 			searchFields := []string{}
 
@@ -187,9 +185,7 @@ func (p Postgresql) loop() {
 					}
 				}
 
-				if p.app.config.debug {
-					fmt.Printf("PostgreSQL duplicate check result: %v, object: %+v\n", objectIsDuplicate, newObj)
-				}
+				p.app.logger.Debug("PostgreSQL duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
 
 				if !foundDuplicate {
 					switch newObj.Operation {
@@ -279,10 +275,8 @@ func (p Postgresql) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locationInSystem string, objectType string, originalObj *Object) error {
 
-	if p.app.config.debug {
-		b, _ := json.MarshalIndent(data, "", "  ")
-		fmt.Printf("Upserting to PostgreSQL: %s\n", string(b))
-	}
+	b, _ := json.MarshalIndent(data, "", "  ")
+	p.app.logger.Debug("Upserting to PostgreSQL", "data", string(b))
 
 	var foundMatch bool
 	var conflictField string
@@ -371,10 +365,8 @@ func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locat
 	expiringObj := newExpiringObject(*originalObj, p.app.config.keepDuplicatesFor)
 	p.duplicateChecker[objectType] = append(p.duplicateChecker[objectType], expiringObj)
 
-	if p.app.config.debug {
-		b, _ := json.MarshalIndent(originalObj, "", "  ")
-		fmt.Printf("PostgreSQL added to duplicate checker: %v\n", string(b))
-	}
+	b, _ = json.MarshalIndent(originalObj, "", "  ")
+	p.app.logger.Debug("PostgreSQL added to duplicate checker", "object", string(b))
 
 	return nil
 }
@@ -509,9 +501,7 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 		return fmt.Errorf("error unmarshalling CDC event: %v", err)
 	}
 
-	if p.app.config.debug {
-		fmt.Printf("PostgreSQL received CDC event: %s\n", jsonString)
-	}
+	p.app.logger.Debug("PostgreSQL received CDC event", "event", jsonString)
 
 	for _, change := range event.Change {
 		pullLocation := change.Schema + "." + change.Table
@@ -562,7 +552,7 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 				return fmt.Errorf("no schema found for pull location: %s", pullLocation)
 			}
 
-			err = schema.Validate(obj)
+			err = schema.Validator.Validate(obj)
 			if err != nil {
 				return fmt.Errorf("object failed postgresql schema validation for '%s': %v", pullLocation, err)
 			}
@@ -601,9 +591,7 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 				}
 			}
 
-			if p.app.config.debug {
-				fmt.Printf("PostgreSQL duplicate check result: %v, object: %+v\n", objectIsDuplicate, obj)
-			}
+			p.app.logger.Debug("PostgreSQL duplicate check result", "isDuplicate", objectIsDuplicate, "object", obj)
 
 			if !foundDuplicate {
 
@@ -619,9 +607,7 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 				expiringObj := newExpiringObject(object, p.app.config.keepDuplicatesFor)
 				p.duplicateChecker[schemaName] = append(p.duplicateChecker[schemaName], expiringObj)
 
-				if p.app.config.debug {
-					fmt.Printf("PostgreSQL added to queue and duplicate checker: %v\n", object)
-				}
+				p.app.logger.Debug("PostgreSQL added to queue and duplicate checker", "object", object)
 			}
 		}
 	}
@@ -632,10 +618,8 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 // deleteFromPostgresql deletes a row from PostgreSQL based on the searchFields and payload.
 func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []string, locationInSystem string, originalObj *Object) error {
 
-	if p.app.config.debug {
-		b, _ := json.MarshalIndent(payload, "", "  ")
-		fmt.Printf("Deleting from PostgreSQL: %s\n", string(b))
-	}
+	b, _ := json.MarshalIndent(payload, "", "  ")
+	p.app.logger.Debug("Deleting from PostgreSQL", "payload", string(b))
 
 	if len(searchFields) == 0 {
 		return fmt.Errorf("no search fields provided for delete operation")
@@ -664,10 +648,8 @@ func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []
 	expiringObj := newExpiringObject(*originalObj, p.app.config.keepDuplicatesFor)
 	p.duplicateChecker[originalObj.Type] = append(p.duplicateChecker[originalObj.Type], expiringObj)
 
-	if p.app.config.debug {
-		b, _ := json.MarshalIndent(originalObj, "", "  ")
-		fmt.Printf("PostgreSQL added to duplicate checker: %v\n", string(b))
-	}
+	b, _ = json.MarshalIndent(originalObj, "", "  ")
+	p.app.logger.Debug("PostgreSQL added to duplicate checker", "object", string(b))
 
 	return nil
 }

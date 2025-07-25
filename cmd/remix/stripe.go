@@ -22,10 +22,8 @@ func (s Stripe) deleteFromStripe(endpoint string, object Object, searchKey, sear
 		return fmt.Errorf("deleteFromStripe: searchKey and searchValue must be provided")
 	}
 
-	if s.app.config.debug {
-		b, _ := json.MarshalIndent(object, "", "  ")
-		fmt.Printf("Stripe deleting object: %s\n", string(b))
-	}
+	b, _ := json.MarshalIndent(object, "", "  ")
+	s.app.logger.Debug("Stripe deleting object", "object", string(b))
 
 	baseURL := "https://api.stripe.com/v1"
 	deleteUrl := fmt.Sprintf("%s/%s/%s", baseURL, endpoint, searchValue)
@@ -36,7 +34,7 @@ func (s Stripe) deleteFromStripe(endpoint string, object Object, searchKey, sear
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	fmt.Printf("Making DELETE request to Stripe: %s\n", deleteUrl)
+	s.app.logger.Debug("Making DELETE request to Stripe", "url", deleteUrl)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to delete object at stripe route %s, error making request: %w", deleteUrl, err)
@@ -151,10 +149,8 @@ func (s Stripe) watchQueue() {
 			var searchKey string
 			var searchValue string
 
-			if s.app.config.debug {
-				b, _ := json.MarshalIndent(object, "", "  ")
-				fmt.Printf("Stripe got object from queue: %s\n", string(b))
-			}
+			b, _ := json.MarshalIndent(object, "", "  ")
+			s.app.logger.Debug("Stripe got object from queue", "object", string(b))
 
 			for locationInSystem, pushLocation := range s.systemInfo.PushMixer[object.Type] {
 				newObj := Object{
@@ -195,9 +191,7 @@ func (s Stripe) watchQueue() {
 					}
 				}
 
-				if s.app.config.debug {
-					fmt.Printf("Stripe duplicate check result: %v, object: %+v\n", objectIsDuplicate, newObj)
-				}
+				s.app.logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
 
 				if !foundDuplicate {
 					switch object.Operation {
@@ -228,10 +222,8 @@ func (s Stripe) upsertObject(endpoint string, object Object, objectType string, 
 	// Replace with your actual secret key or use an environment variable
 	form := url.Values{}
 
-	if s.app.config.debug {
-		b, _ := json.MarshalIndent(object, "", "  ")
-		fmt.Printf("Stripe upserting object: %s\n", string(b))
-	}
+	b, _ := json.MarshalIndent(object, "", "  ")
+	s.app.logger.Debug("Stripe upserting object", "object", string(b))
 
 	for key, value := range object.Payload {
 
@@ -317,10 +309,8 @@ func (s Stripe) upsertObject(endpoint string, object Object, objectType string, 
 	expiringObj := newExpiringObject(object, s.app.config.keepDuplicatesFor)
 	s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], expiringObj)
 
-	if s.app.config.debug {
-		b, _ := json.MarshalIndent(object, "", "  ")
-		fmt.Printf("Stripe added to queue and duplicate checker: %s\n", string(b))
-	}
+	b, _ = json.MarshalIndent(object, "", "  ")
+	s.app.logger.Debug("Stripe added to queue and duplicate checker", "object", string(b))
 
 	return body, nil
 }
@@ -337,9 +327,7 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.app.config.debug {
-		s.app.logger.Info("Received Stripe event", "event_type", event.Type)
-	}
+	s.app.logger.Debug("Received Stripe event", "event_type", event.Type)
 
 	objectName := string(event.Type)
 	var operationType string
@@ -366,10 +354,8 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.app.config.debug {
-		b, _ := json.MarshalIndent(obj, "", "  ")
-		fmt.Printf("Stripe received object: %s\n", string(b))
-	}
+	b, _ := json.MarshalIndent(obj, "", "  ")
+	s.app.logger.Debug("Stripe received object", "object", string(b))
 
 	newObjs := make(map[string]map[string]any)
 
@@ -401,7 +387,7 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		err = schema.Validate(obj)
+		err = schema.Validator.Validate(obj)
 		if err != nil {
 			fmt.Printf("Object failed stripe schema validation for '%s': %v\n", objectName, err)
 			return
@@ -429,9 +415,7 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		if s.app.config.debug {
-			fmt.Printf("Stripe duplicate check result: %v, object: %+v\n", objectIsDuplicate, obj)
-		}
+		s.app.logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", obj)
 
 		if !foundDuplicate {
 
@@ -445,9 +429,7 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			expiringObj := newExpiringObject(object, s.app.config.keepDuplicatesFor)
 			s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName], expiringObj)
 
-			if s.app.config.debug {
-				fmt.Printf("Stripe added to queue and duplicate checker: %+v\n", object)
-			}
+			s.app.logger.Debug("Stripe added to queue and duplicate checker", "object", object)
 		}
 	}
 }
