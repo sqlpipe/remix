@@ -7,10 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -60,6 +58,21 @@ func TestTwoTablesStreaming(t *testing.T) {
 		t.Fatalf("Could not connect to docker: %s", err)
 	}
 
+	// --- CLEANUP AT START: Remove any existing resources ---
+	removeIfExists := func(name string) {
+		_ = pool.RemoveContainerByName(name)
+	}
+	removeNetworkIfExists := func(name string) {
+		nets, err := pool.NetworksByName(name)
+		if err == nil && len(nets) > 0 {
+			_ = pool.RemoveNetwork(&nets[0])
+		}
+	}
+	removeIfExists("remix")
+	removeIfExists("test-postgres")
+	removeNetworkIfExists("sqlpipe-test-network")
+	// --- END CLEANUP AT START ---
+
 	pool.MaxWait = 20 * time.Second
 
 	postgresqlPassword := "Mypass123"
@@ -73,57 +86,21 @@ func TestTwoTablesStreaming(t *testing.T) {
 		sqlpipeContainer    *dockertest.Resource
 	)
 
-	// Setup signal handler for cleanup with improved error handling
-	cleanup := func() {
-		// Helper to check for specific Docker errors
-		isAlreadyRemoving := func(err error) bool {
-			return err != nil && (strings.Contains(err.Error(), "removal of container") && strings.Contains(err.Error(), "is already in progress"))
-		}
-		isNetworkActive := func(err error) bool {
-			return err != nil && (strings.Contains(err.Error(), "network") && strings.Contains(err.Error(), "has active endpoints"))
-		}
+	// REMOVE signal handler and defer cleanup logic
 
-		if sqlpipeContainer != nil {
-			if err := pool.Purge(sqlpipeContainer); err != nil && !isAlreadyRemoving(err) {
-				log.Printf("Could not purge sqlpipe resource: %s", err)
-			}
-		}
-		if postgresqlContainer != nil {
-			if err := pool.Purge(postgresqlContainer); err != nil && !isAlreadyRemoving(err) {
-				log.Printf("Could not purge resource: %s", err)
-			}
-		}
-		if network != nil {
-			// Retry network removal if it has active endpoints
-			for i := 0; i < 5; i++ {
-				if err := pool.RemoveNetwork(network); err != nil {
-					if isNetworkActive(err) {
-						time.Sleep(1 * time.Second)
-						continue
-					}
-					log.Printf("Could not remove docker network: %s", err)
-					break
-				}
-				break // success
-			}
-		}
-	}
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt)
-	go func() {
-		<-sigs
-		log.Println("Interrupt received, cleaning up Docker resources...")
-		cleanup()
-		os.Exit(1)
-	}()
-
-	defer cleanup()
-
-	// Create a network for both containers
-	network, err = pool.CreateNetwork("sqlpipe-test-network")
+	// Create a network for both containers, only if it doesn't already exist
+	networks, err := pool.NetworksByName("sqlpipe-test-network")
 	if err != nil {
-		t.Fatalf("Could not create docker network: %s", err)
+		t.Fatalf("Could not list docker networks: %s", err)
+	}
+	if len(networks) > 0 {
+		network = &networks[0]
+		log.Printf("Using existing docker network: %s", network.Network.Name)
+	} else {
+		network, err = pool.CreateNetwork("sqlpipe-test-network")
+		if err != nil {
+			t.Fatalf("Could not create docker network: %s", err)
+		}
 	}
 
 	postgresqlContainer, err = pool.BuildAndRunWithOptions("./postgresql.dockerfile", &dockertest.RunOptions{
@@ -184,7 +161,7 @@ func TestTwoTablesStreaming(t *testing.T) {
 		t.Fatalf("Failed to build remix app: %v", err)
 	}
 
-	systemsHostDir, err := filepath.Abs("./config/two-tables/systems")
+	systemsHostDir, err := filepath.Abs("./config/two-tables")
 	if err != nil {
 		t.Fatalf("Failed to get absolute path for systems config: %v", err)
 	}
@@ -192,7 +169,7 @@ func TestTwoTablesStreaming(t *testing.T) {
 		t.Fatalf("Systems config directory does not exist: %s", systemsHostDir)
 	}
 
-	modelsHostDir, err := filepath.Abs("./config/two-tables/models")
+	modelsHostDir, err := filepath.Abs("./config/two-tables")
 	if err != nil {
 		t.Fatalf("Failed to get absolute path for models config: %v", err)
 	}
@@ -204,8 +181,7 @@ func TestTwoTablesStreaming(t *testing.T) {
 		Name: "remix",
 		Env: []string{
 			"PORT=4000",
-			"SYSTEMS_DIR=/config/two-tables/systems",
-			"MODELS_DIR=/config/two-tables/models",
+			"CONFIG_DIR=/config/two-tables",
 		},
 		Mounts: []string{
 			fmt.Sprintf("%s:/config/two-tables/systems", systemsHostDir),

@@ -2,12 +2,13 @@
 
 set -e
 
-ARGS="-systems-dir $SYSTEMS_DIR -models-dir $MODELS_DIR"
-
-if [ "$DEBUG" = "true" ]; then
-  ARGS="$ARGS -debug"
-fi
-
+ARGS="-config-dir $CONFIG_DIR"
 ARGS="$ARGS -port $PORT"
+if [ ! -z "$LOG_LEVEL" ]; then
+  ARGS="$ARGS -log-level $LOG_LEVEL"
+fi
+if [ ! -z "$DUPLICATE_CACHE_SIZE" ]; then
+  ARGS="$ARGS -duplicate-cache-size $DUPLICATE_CACHE_SIZE"
+fi
 
 exec /bin/remix $ARGS

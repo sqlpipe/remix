@@ -49,15 +49,26 @@ build/remix:
 	GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o=./bin/remix ./cmd/remix
 	# go build -ldflags="-w -s" -o=./bin/remix ./cmd/remix
 
-## build/docker: build the cmd/remix docker image and push
-.PHONY: build/docker
-build/docker:
+## build/docker/latest: build the cmd/remix docker image and push
+.PHONY: build/docker/latest
+build/docker/latest:
 	@echo 'Building cmd/remix...'
 	GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o=./bin/remix ./cmd/remix
 	@echo 'Building docker image...'
 	docker buildx build --platform linux/amd64 -t sqlpipe/remix:latest -f dockerfile . --load
 	@echo 'Pushing docker image...'
 	docker push sqlpipe/remix:latest
+
+
+## build/docker/dev: build the cmd/remix docker image and push
+.PHONY: build/docker/dev
+build/docker/dev:
+	@echo 'Building cmd/remix...'
+	GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o=./bin/remix ./cmd/remix
+	@echo 'Building docker image...'
+	docker buildx build --platform linux/amd64 -t sqlpipe/remix:dev -f dockerfile . --load
+	@echo 'Pushing docker image...'
+	docker push sqlpipe/remix:dev
 
 ## test: run tests in the /test directory
 .PHONY: test

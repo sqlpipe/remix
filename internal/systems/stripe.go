@@ -103,7 +103,7 @@ func newStripe(systemInfo SystemInfo) (system SystemInterface, err error) {
 		break
 	}
 
-	app.Logger.Info("Stripe test api call was successful", "system", systemInfo.Name)
+	app.Logger.Debug("Stripe test api call was successful", "system", systemInfo.Name)
 
 	stripeSystem := &Stripe{
 		client:           stripeClient,
