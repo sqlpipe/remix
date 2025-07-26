@@ -1,10 +1,14 @@
-package main
+package systems
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"time"
 )
+
+var SystemMap = make(map[string]SystemInterface)
 
 var (
 	Statuses = []string{StatusQueued, StatusRunning, StatusCancelled, StatusError, StatusComplete, ""}
@@ -67,18 +71,36 @@ type SystemInfo struct {
 }
 
 type SystemInterface interface {
-	handleWebhook(w http.ResponseWriter, r *http.Request)
+	HandleWebhook(w http.ResponseWriter, r *http.Request)
 }
 
-func (app *application) NewSystem(systemInfo SystemInfo, port int, duplicateChecker map[string][]ExpiringObject) (system SystemInterface, err error) {
+func NewSystem(systemInfo SystemInfo) (system SystemInterface, err error) {
 	switch systemInfo.Type {
 	case TypePostgreSQL:
-		return app.newPostgresql(systemInfo, duplicateChecker)
+		return newPostgresql(systemInfo)
 	case TypeSnowflake:
 		return newSnowflake(systemInfo)
 	case TypeStripe:
-		return app.newStripe(systemInfo, duplicateChecker)
+		return newStripe(systemInfo)
 	default:
 		return system, fmt.Errorf("unsupported system type %v", systemInfo.Type)
 	}
+}
+
+func openConnectionPool(name, connectionString, driverName string) (connectionPool *sql.DB, err error) {
+
+	connectionPool, err = sql.Open(driverName, connectionString)
+	if err != nil {
+		return nil, fmt.Errorf("error opening connection to %v :: %v", name, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = connectionPool.PingContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error pinging %v :: %v", name, err)
+	}
+
+	return connectionPool, nil
 }

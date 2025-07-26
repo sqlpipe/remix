@@ -1,4 +1,4 @@
-package main
+package systems
 
 import (
 	"bytes"
@@ -12,18 +12,20 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/sqlpipe/remix/internal/app"
+	"github.com/sqlpipe/remix/internal/helpers"
 	"github.com/stripe/stripe-go/v82"
 	"golang.org/x/time/rate"
 )
 
 // deleteFromStripe simulates deleting an object from Stripe based on the searchKey and searchValue.
-func (s Stripe) deleteFromStripe(endpoint string, object Object, searchKey, searchValue string) error {
+func (s Stripe) deleteFromStripe(endpoint string, object app.Object, searchKey, searchValue string) error {
 	if searchKey == "" || searchValue == "" {
 		return fmt.Errorf("deleteFromStripe: searchKey and searchValue must be provided")
 	}
 
 	b, _ := json.MarshalIndent(object, "", "  ")
-	s.app.logger.Debug("Stripe deleting object", "object", string(b))
+	app.Logger.Debug("Stripe deleting object", "object", string(b))
 
 	baseURL := "https://api.stripe.com/v1"
 	deleteUrl := fmt.Sprintf("%s/%s/%s", baseURL, endpoint, searchValue)
@@ -34,7 +36,7 @@ func (s Stripe) deleteFromStripe(endpoint string, object Object, searchKey, sear
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	s.app.logger.Debug("Making DELETE request to Stripe", "url", deleteUrl)
+	app.Logger.Debug("Making DELETE request to Stripe", "url", deleteUrl)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to delete object at stripe route %s, error making request: %w", deleteUrl, err)
@@ -56,13 +58,12 @@ func (s Stripe) deleteFromStripe(endpoint string, object Object, searchKey, sear
 type Stripe struct {
 	client           *stripe.Client
 	apiKey           string
-	app              *application
 	limiter          *rate.Limiter
 	systemInfo       SystemInfo
-	duplicateChecker map[string][]ExpiringObject
+	duplicateChecker map[string][]*app.Object
 }
 
-func (app *application) newStripe(systemInfo SystemInfo, duplicateChecker map[string][]ExpiringObject) (system SystemInterface, err error) {
+func newStripe(systemInfo SystemInfo) (system SystemInterface, err error) {
 
 	if systemInfo.UseCliListener {
 
@@ -71,14 +72,14 @@ func (app *application) newStripe(systemInfo SystemInfo, duplicateChecker map[st
 		}
 
 		// Forward Stripe events to our local endpoint
-		forwardURL := fmt.Sprintf("http://localhost:%d/%v", app.config.port, systemInfo.Name)
+		forwardURL := fmt.Sprintf("http://localhost:%d/%v", app.Config.Port, systemInfo.Name)
 		cmd := exec.Command("stripe", "listen", "--forward-to", forwardURL)
 		cmd.Stderr = os.Stderr
 
 		cmd.Env = append(os.Environ(), fmt.Sprintf("STRIPE_API_KEY=%s", systemInfo.ApiKey))
 
 		go func() {
-			app.logger.Info("Starting Stripe CLI listener", "command", cmd.String())
+			app.Logger.Info("Starting Stripe CLI listener", "command", cmd.String())
 			err := cmd.Run()
 			if err != nil {
 				return
@@ -102,18 +103,21 @@ func (app *application) newStripe(systemInfo SystemInfo, duplicateChecker map[st
 		break
 	}
 
-	app.logger.Info("Stripe test api call was successful", "system", systemInfo.Name)
+	app.Logger.Info("Stripe test api call was successful", "system", systemInfo.Name)
 
 	stripeSystem := &Stripe{
 		client:           stripeClient,
-		app:              app,
 		limiter:          rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
 		systemInfo:       systemInfo,
-		duplicateChecker: duplicateChecker,
+		duplicateChecker: make(map[string][]*app.Object),
 		apiKey:           systemInfo.ApiKey,
 	}
 
-	app.storageEngine.setSafeIndexMap(systemInfo.Name, 0)
+	for schemaName := range app.SchemaMap {
+		stripeSystem.duplicateChecker[schemaName] = make([]*app.Object, 0)
+	}
+
+	app.ObjectStore.SetSafeIndexMap(systemInfo.Name, 0)
 
 	go stripeSystem.watchQueue()
 
@@ -125,7 +129,7 @@ func (s Stripe) watchQueue() {
 	for {
 		// Get the last safe object index for this system
 		var exists bool
-		index, exists = s.app.storageEngine.getSafeIndexMap(s.systemInfo.Name)
+		index, exists = app.ObjectStore.GetSafeIndexMap(s.systemInfo.Name)
 		if !exists {
 			panic(fmt.Sprintf("safe index not found for system %s", s.systemInfo.Name))
 		}
@@ -138,7 +142,7 @@ func (s Stripe) watchQueue() {
 		}
 
 		// Query safeObjects after lastIndex
-		objects := s.app.storageEngine.getSafeObjectsFromIndex(index)
+		objects := app.ObjectStore.GetSafeObjectsFromIndex(index)
 		if len(objects) > 0 {
 			// Process new objects as needed
 			index += int64(len(objects))
@@ -150,10 +154,10 @@ func (s Stripe) watchQueue() {
 			var searchValue string
 
 			b, _ := json.MarshalIndent(object, "", "  ")
-			s.app.logger.Debug("Stripe got object from queue", "object", string(b))
+			app.Logger.Debug("Stripe got object from queue", "object", string(b))
 
 			for locationInSystem, pushLocation := range s.systemInfo.PushMixer[object.Type] {
-				newObj := Object{
+				newObj := app.Object{
 					Payload:   make(map[string]any),
 					Operation: object.Operation,
 					Type:      object.Type,
@@ -168,7 +172,7 @@ func (s Stripe) watchQueue() {
 						}
 					}
 
-					if field.Hardcode != nil && !isZeroValue(field.Hardcode) {
+					if field.Hardcode != nil && !helpers.IsZeroValue(field.Hardcode) {
 						newObj.Payload[field.Field] = field.Hardcode
 					}
 				}
@@ -177,7 +181,7 @@ func (s Stripe) watchQueue() {
 				foundDuplicate := false
 				for i, expiringObj := range s.duplicateChecker[object.Type] {
 					objectIsDuplicate = true
-					for k, v := range expiringObj.Object.Payload {
+					for k, v := range expiringObj.Payload {
 						if v != object.Payload[k] {
 							objectIsDuplicate = false
 							break
@@ -191,7 +195,7 @@ func (s Stripe) watchQueue() {
 					}
 				}
 
-				s.app.logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
+				app.Logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
 
 				if !foundDuplicate {
 					switch object.Operation {
@@ -199,13 +203,13 @@ func (s Stripe) watchQueue() {
 						// Upsert the object to Stripe
 						_, err := s.upsertObject(locationInSystem, newObj, object.Type, searchKey, searchValue)
 						if err != nil {
-							s.app.logger.Error("Failed to upsert object to Stripe", "error", err, "object", newObj)
+							app.Logger.Error("Failed to upsert object to Stripe", "error", err, "object", newObj)
 							continue
 						}
 					case "delete":
 						err := s.deleteFromStripe(locationInSystem, newObj, searchKey, searchValue)
 						if err != nil {
-							s.app.logger.Error("Failed to delete object from Stripe", "error", err, "object", newObj)
+							app.Logger.Error("Failed to delete object from Stripe", "error", err, "object", newObj)
 							continue
 						}
 					}
@@ -214,16 +218,16 @@ func (s Stripe) watchQueue() {
 		}
 
 		// Update the safe index map for this system
-		s.app.storageEngine.setSafeIndexMap(s.systemInfo.Name, index)
+		app.ObjectStore.SetSafeIndexMap(s.systemInfo.Name, index)
 	}
 }
 
-func (s Stripe) upsertObject(endpoint string, object Object, objectType string, searchKey, searchValue string) ([]byte, error) {
+func (s Stripe) upsertObject(endpoint string, object app.Object, objectType string, searchKey, searchValue string) ([]byte, error) {
 	// Replace with your actual secret key or use an environment variable
 	form := url.Values{}
 
 	b, _ := json.MarshalIndent(object, "", "  ")
-	s.app.logger.Debug("Stripe upserting object", "object", string(b))
+	app.Logger.Debug("Stripe upserting object", "object", string(b))
 
 	for key, value := range object.Payload {
 
@@ -280,8 +284,12 @@ func (s Stripe) upsertObject(endpoint string, object Object, objectType string, 
 			return nil, fmt.Errorf("failed to create object at stripe route %s, status code: %d, response: %s", createUrl, resp.StatusCode, string(body))
 		}
 
-		expiringObj := newExpiringObject(object, s.app.config.keepDuplicatesFor)
-		s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], expiringObj)
+		newObject := &app.Object{
+			Type:      objectType,
+			Operation: object.Operation,
+			Payload:   object.Payload,
+		}
+		s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], newObject)
 		return body, nil
 	}
 
@@ -306,16 +314,20 @@ func (s Stripe) upsertObject(endpoint string, object Object, objectType string, 
 		return nil, fmt.Errorf("failed to read response body from stripe route %s, error reading response body: %w", updateUrl, err)
 	}
 
-	expiringObj := newExpiringObject(object, s.app.config.keepDuplicatesFor)
-	s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], expiringObj)
+	newObject := &app.Object{
+		Type:      objectType,
+		Operation: object.Operation,
+		Payload:   object.Payload,
+	}
+	s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], newObject)
 
 	b, _ = json.MarshalIndent(object, "", "  ")
-	s.app.logger.Debug("Stripe added to queue and duplicate checker", "object", string(b))
+	app.Logger.Debug("Stripe added to queue and duplicate checker", "object", string(b))
 
 	return body, nil
 }
 
-func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
+func (s *Stripe) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	// Immediately acknowledge receipt to Stripe
 	w.WriteHeader(http.StatusOK)
@@ -323,11 +335,11 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	var event stripe.Event
 	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-		s.app.logger.Error("Failed to decode Stripe event", "error", err)
+		app.Logger.Error("Failed to decode Stripe event", "error", err)
 		return
 	}
 
-	s.app.logger.Debug("Received Stripe event", "event_type", event.Type)
+	app.Logger.Debug("Received Stripe event", "event_type", event.Type)
 
 	objectName := string(event.Type)
 	var operationType string
@@ -343,19 +355,19 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	case "deleted":
 		operationType = "delete"
 	default:
-		s.app.logger.Error("Unknown Stripe event type", "event_type", event.Type)
+		app.Logger.Error("Unknown Stripe event type", "event_type", event.Type)
 		return
 	}
 
 	var obj map[string]any
 	err = json.Unmarshal(event.Data.Raw, &obj)
 	if err != nil {
-		s.app.logger.Error("Failed to unmarshal Stripe event data", "error", err)
+		app.Logger.Error("Failed to unmarshal Stripe event data", "error", err)
 		return
 	}
 
 	b, _ := json.MarshalIndent(obj, "", "  ")
-	s.app.logger.Debug("Stripe received object", "object", string(b))
+	app.Logger.Debug("Stripe received object", "object", string(b))
 
 	newObjs := make(map[string]map[string]any)
 
@@ -363,10 +375,10 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		newModel := map[string]any{}
 
 		for keyInObj, field := range fields {
-			if field.Hardcode != nil && !isZeroValue(field.Hardcode) {
+			if field.Hardcode != nil && !helpers.IsZeroValue(field.Hardcode) {
 				newModel[field.Field] = field.Hardcode
 			} else {
-				newModel[field.Field] = getNestedValue(obj, keyInObj)
+				newModel[field.Field] = helpers.GetNestedValue(obj, keyInObj)
 			}
 		}
 
@@ -375,7 +387,7 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	for schemaName, obj := range newObjs {
 
-		schema, inMap := s.app.schemaMap[schemaName]
+		schema, inMap := app.SchemaMap[schemaName]
 		if !inMap {
 			fmt.Printf("No schema found for object: %s\n", objectName)
 			return
@@ -387,7 +399,7 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		err = schema.Validator.Validate(obj)
+		err = schema.Validate(obj)
 		if err != nil {
 			fmt.Printf("Object failed stripe schema validation for '%s': %v\n", objectName, err)
 			return
@@ -400,7 +412,7 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			objectIsDuplicate = true
 
 			for k, v := range obj {
-				if v != expiringObj.Object.Payload[k] {
+				if v != expiringObj.Payload[k] {
 					objectIsDuplicate = false
 					break
 				}
@@ -415,21 +427,20 @@ func (s *Stripe) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		s.app.logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", obj)
+		app.Logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", obj)
 
 		if !foundDuplicate {
 
-			object := Object{
+			object := app.Object{
 				Type:      schemaName,
 				Operation: operationType,
 				Payload:   obj,
 			}
 
-			s.app.storageEngine.addSafeObject(object)
-			expiringObj := newExpiringObject(object, s.app.config.keepDuplicatesFor)
-			s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName], expiringObj)
+			app.ObjectStore.AddSafeObject(object)
+			s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName], &object)
 
-			s.app.logger.Debug("Stripe added to queue and duplicate checker", "object", object)
+			app.Logger.Debug("Stripe added to queue and duplicate checker", "object", object)
 		}
 	}
 }

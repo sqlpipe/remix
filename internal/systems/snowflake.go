@@ -1,4 +1,4 @@
-package main
+package systems
 
 import (
 	"database/sql"
@@ -23,6 +23,6 @@ func newSnowflake(systemInfo SystemInfo) (snowflake Snowflake, err error) {
 	return snowflake, nil
 }
 
-func (s Snowflake) handleWebhook(w http.ResponseWriter, r *http.Request) {
+func (s Snowflake) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	// Snowflake will not send us webhooks, so this is a no-op
 }
