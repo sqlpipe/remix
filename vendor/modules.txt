@@ -418,6 +418,9 @@ github.com/snowflakedb/gosnowflake
 ## explicit; go 1.18
 github.com/stripe/stripe-go/v82
 github.com/stripe/stripe-go/v82/form
+# github.com/tomasen/realip v0.0.0-20180522021738-f0c99a92ddce
+## explicit
+github.com/tomasen/realip
 # github.com/xeipuuv/gojsonpointer v0.0.0-20190905194746-02993c407bfb
 ## explicit
 github.com/xeipuuv/gojsonpointer

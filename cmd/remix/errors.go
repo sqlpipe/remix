@@ -37,3 +37,8 @@ func serverErrorResponse(w http.ResponseWriter, r *http.Request, err error) {
 	message := "the server encountered a problem and could not process your request"
 	errorResponse(w, r, http.StatusInternalServerError, message)
 }
+
+func rateLimitExceededResponse(w http.ResponseWriter, r *http.Request) {
+	message := "rate limit exceeded"
+	errorResponse(w, r, http.StatusTooManyRequests, message)
+}

@@ -16,7 +16,5 @@ func routes() http.Handler {
 	router.HandlerFunc(http.MethodGet, "/v1/healthcheck", healthcheckHandler)
 	router.Handler(http.MethodGet, "/debug/vars", expvar.Handler())
 
-	return router
-
-	// return app.metrics(app.recoverPanic(app.enableCORS(app.rateLimit(app.authenticate(router)))))
+	return metrics(recoverPanic(rateLimit(router)))
 }

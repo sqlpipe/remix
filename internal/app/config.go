@@ -6,6 +6,11 @@ type config struct {
 	DuplicateCacheSize int
 	LogLevel           string
 	DisplayVersion     bool
+	Limiter            struct {
+		Enabled bool
+		Rps     float64
+		Burst   int
+	}
 }
 
 var Config = &config{}

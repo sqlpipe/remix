@@ -10,6 +10,7 @@ require (
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/snowflakedb/gosnowflake v1.6.25
 	github.com/stripe/stripe-go/v82 v82.3.0
+	github.com/tomasen/realip v0.0.0-20180522021738-f0c99a92ddce
 	golang.org/x/time v0.12.0
 	gopkg.in/yaml.v3 v3.0.1
 )

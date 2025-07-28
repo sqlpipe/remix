@@ -51,7 +51,6 @@ func newPostgresql(systemInfo SystemInfo) (postgresql Postgresql, err error) {
 	}
 
 	go postgresql.loop()
-	// go postgresql.watchCDC()
 
 	return postgresql, nil
 }
@@ -355,109 +354,6 @@ func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locat
 	app.Logger.Debug("PostgreSQL added to duplicate checker", "object", string(b))
 
 	return nil
-}
-
-// Start CDC for all tables in publication
-func (p *Postgresql) watchCDC() {
-	slotName := "sqlpipe_slot"
-	outputPlugin := "wal2json"
-
-	replConn, err := pgconn.Connect(context.Background(), p.systemInfo.ReplicationDsn)
-	if err != nil {
-		app.Logger.Error("failed to connect", "error", err)
-		os.Exit(1)
-	}
-	defer replConn.Close(context.Background())
-
-	sysident, err := pglogrepl.IdentifySystem(context.Background(), replConn)
-	if err != nil {
-		app.Logger.Error("IdentifySystem failed", "error", err)
-		os.Exit(1)
-	}
-
-	_, err = pglogrepl.CreateReplicationSlot(context.Background(), replConn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Temporary: false, Mode: pglogrepl.LogicalReplication})
-	if err != nil {
-		// If the error is "already exists", it's OK, otherwise fail
-		if !strings.Contains(err.Error(), "already exists") {
-			app.Logger.Error("CreateReplicationSlot failed", "error", err)
-			os.Exit(1)
-		}
-	}
-
-	pluginArguments := []string{"\"pretty-print\" 'true'"}
-	err = pglogrepl.StartReplication(context.Background(), replConn, slotName, sysident.XLogPos,
-		pglogrepl.StartReplicationOptions{
-			PluginArgs: pluginArguments,
-		})
-	if err != nil {
-		app.Logger.Error("StartReplication failed", "error", err)
-		os.Exit(1)
-	}
-
-	clientXLogPos := sysident.XLogPos
-	standbyMessageTimeout := time.Second * 10
-	nextStandbyMessageDeadline := time.Now().Add(standbyMessageTimeout)
-
-	for {
-		if time.Now().After(nextStandbyMessageDeadline) {
-			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), replConn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
-			if err != nil {
-				log.Fatalln("SendStandbyStatusUpdate failed:", err)
-			}
-			nextStandbyMessageDeadline = time.Now().Add(standbyMessageTimeout)
-		}
-
-		ctx, cancel := context.WithDeadline(context.Background(), nextStandbyMessageDeadline)
-		rawMsg, err := replConn.ReceiveMessage(ctx)
-		cancel()
-		if err != nil {
-			if pgconn.Timeout(err) {
-				continue
-			}
-			log.Fatalln("ReceiveMessage failed:", err)
-		}
-
-		if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
-			log.Fatalf("received Postgres WAL error: %+v", errMsg)
-		}
-
-		msg, ok := rawMsg.(*pgproto3.CopyData)
-		if !ok {
-			log.Printf("Received unexpected message: %T\n", rawMsg)
-			continue
-		}
-
-		switch msg.Data[0] {
-		case pglogrepl.PrimaryKeepaliveMessageByteID:
-			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
-			if err != nil {
-				log.Fatalln("ParsePrimaryKeepaliveMessage failed:", err)
-			}
-			if pkm.ServerWALEnd > clientXLogPos {
-				clientXLogPos = pkm.ServerWALEnd
-			}
-			if pkm.ReplyRequested {
-				nextStandbyMessageDeadline = time.Time{}
-			}
-
-		case pglogrepl.XLogDataByteID:
-			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
-			if err != nil {
-				log.Fatalln("ParseXLogData failed:", err)
-			}
-
-			err = p.handleCdcEvent(string(xld.WALData))
-			if err != nil {
-				app.Logger.Error("error handling CDC event", "error", err, "data", string(xld.WALData))
-				return
-			}
-
-			if xld.WALStart > clientXLogPos {
-				clientXLogPos = xld.WALStart
-			}
-		default:
-		}
-	}
 }
 
 type OldKeys struct {
