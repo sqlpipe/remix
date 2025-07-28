@@ -62,7 +62,7 @@ func TestOneTableStreaming(t *testing.T) {
 	removeNetworkIfExists("sqlpipe-test-network")
 	// --- END CLEANUP AT START ---
 
-	pool.MaxWait = 5 * time.Second
+	pool.MaxWait = 10 * time.Second
 
 	postgresqlPassword := "Mypass123"
 	postgresqlUsername := "postgres"
@@ -130,11 +130,6 @@ func TestOneTableStreaming(t *testing.T) {
 
 	createPostgresqlProductsTable(t, db)
 
-	_, err = db.Exec(`CREATE PUBLICATION my_pub FOR ALL TABLES;`)
-	if err != nil {
-		t.Fatalf("Failed to create publication: %v", err)
-	}
-
 	buildCmd := exec.Command("go", []string{"build", "-o", "../bin/remix", "../cmd/remix"}...)
 	buildCmd.Env = append(os.Environ(),
 		"GOOS=linux",
@@ -169,12 +164,17 @@ func TestOneTableStreaming(t *testing.T) {
 		Env: []string{
 			"PORT=4000",
 			"CONFIG_DIR=/config/one-table",
+			"LOG_LEVEL=debug",
 		},
 		Mounts: []string{
 			fmt.Sprintf("%s:/config/one-table/systems", systemsHostDir),
 			fmt.Sprintf("%s:/config/one-table/models", modelsHostDir),
 		},
-		NetworkID: network.Network.ID,
+		NetworkID:    network.Network.ID,
+		ExposedPorts: []string{"4000/tcp"},
+		PortBindings: map[docker.Port][]docker.PortBinding{
+			"4000/tcp": {{HostIP: "0.0.0.0", HostPort: "4000"}},
+		},
 	})
 	if err != nil {
 		t.Fatalf("Could not start resource: %s", err)

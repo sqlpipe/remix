@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 
+	"github.com/sqlpipe/remix/internal/app"
 	"github.com/sqlpipe/remix/internal/helpers"
 	"github.com/sqlpipe/remix/internal/systems"
 	"github.com/sqlpipe/remix/internal/vcs"
@@ -19,11 +20,25 @@ func receiveHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func healthcheckHandler(w http.ResponseWriter, r *http.Request) {
+
+	app.Logger.Debug("got healthcheck request", "ip", r.RemoteAddr)
+
 	env := helpers.Envelope{
 		"status": "available",
 		"system_info": map[string]string{
 			"version": vcs.Version(),
 		},
+	}
+
+	err := helpers.WriteJSON(w, http.StatusOK, env, nil)
+	if err != nil {
+		serverErrorResponse(w, r, err)
+	}
+}
+
+func debugObjectStoreHistoryHandler(w http.ResponseWriter, r *http.Request) {
+	env := helpers.Envelope{
+		"object_store_history": app.ObjectStore.GetSnapshotHistory(),
 	}
 
 	err := helpers.WriteJSON(w, http.StatusOK, env, nil)

@@ -48,26 +48,28 @@ type PushObject map[string]PushLocation
 type PushLocation map[string]Field
 
 type SystemInfo struct {
-	Name               string        `yaml:"name" json:"name"`
-	Type               string        `yaml:"type" json:"type"`
-	ConnectionString   string        `yaml:"dsn" json:"dsn"`
-	MaxOpenConnections int           `yaml:"max_open_connections" json:"max_open_connections"`
-	MaxIdleConnections int           `yaml:"max_idle_connections" json:"max_idle_connections"`
-	MaxIdleTime        time.Duration `yaml:"max_connection_idle_time" json:"max_connection_idle_time"`
-	Hostname           string        `yaml:"hostname,omitempty" json:"hostname,omitempty"`
-	Port               int           `yaml:"port,omitempty" json:"port,omitempty"`
-	Database           string        `yaml:"database,omitempty" json:"database,omitempty"`
-	Username           string        `yaml:"username,omitempty" json:"username,omitempty"`
-	Password           string        `yaml:"-" json:"-"`
-	Dsn                string        `yaml:"-" json:"-"`
-	ReplicationDsn     string        `yaml:"replication_dsn,omitempty" json:"replication_dsn,omitempty"`
-	ApiKey             string        `yaml:"api_key" json:"-"`
-	EndpointSecret     string        `yaml:"-" json:"-"`
-	RateLimit          int           `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
-	RateBucketSize     int           `yaml:"rate_bucket_size,omitempty" json:"rate_bucket_size,omitempty"`
-	UseCliListener     bool          `yaml:"use_cli_listener,omitempty" json:"use_cli_listener,omitempty"`
-	ReceiveMixer       ReceiveMixer  `yaml:"receive_mixer,omitempty" json:"receive_mixer,omitempty"`
-	PushMixer          PushMixer     `yaml:"push_mixer,omitempty" json:"push_mixer,omitempty"`
+	Name                string        `yaml:"name" json:"name"`
+	Type                string        `yaml:"type" json:"type"`
+	ConnectionString    string        `yaml:"dsn" json:"dsn"`
+	MaxOpenConnections  int           `yaml:"max_open_connections" json:"max_open_connections"`
+	MaxIdleConnections  int           `yaml:"max_idle_connections" json:"max_idle_connections"`
+	MaxIdleTime         time.Duration `yaml:"max_connection_idle_time" json:"max_connection_idle_time"`
+	Hostname            string        `yaml:"hostname,omitempty" json:"hostname,omitempty"`
+	Port                int           `yaml:"port,omitempty" json:"port,omitempty"`
+	Database            string        `yaml:"database,omitempty" json:"database,omitempty"`
+	Username            string        `yaml:"username,omitempty" json:"username,omitempty"`
+	Password            string        `yaml:"-" json:"-"`
+	Dsn                 string        `yaml:"-" json:"-"`
+	ReplicationDsn      string        `yaml:"replication_dsn,omitempty" json:"replication_dsn,omitempty"`
+	ApiKey              string        `yaml:"api_key" json:"-"`
+	EndpointSecret      string        `yaml:"-" json:"-"`
+	RateLimit           int           `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
+	RateBucketSize      int           `yaml:"rate_bucket_size,omitempty" json:"rate_bucket_size,omitempty"`
+	UseCliListener      bool          `yaml:"use_cli_listener,omitempty" json:"use_cli_listener,omitempty"`
+	ReceiveMixer        ReceiveMixer  `yaml:"receive_mixer,omitempty" json:"receive_mixer,omitempty"`
+	PushMixer           PushMixer     `yaml:"push_mixer,omitempty" json:"push_mixer,omitempty"`
+	ReplicationSlotName string        `yaml:"replication_slot_name,omitempty" json:"replication_slot_name,omitempty"`
+	PublicationName     string        `yaml:"publication_name,omitempty" json:"publication_name,omitempty"`
 }
 
 type SystemInterface interface {

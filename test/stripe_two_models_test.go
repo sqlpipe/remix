@@ -143,11 +143,6 @@ func TestTwoTablesStreaming(t *testing.T) {
 
 	createPostgresqlProductsAndPricesTables(t, db)
 
-	_, err = db.Exec(`CREATE PUBLICATION my_pub FOR ALL TABLES;`)
-	if err != nil {
-		t.Fatalf("Failed to create publication: %v", err)
-	}
-
 	buildCmd := exec.Command("go", []string{"build", "-o", "../bin/remix", "../cmd/remix"}...)
 	buildCmd.Env = append(os.Environ(),
 		"GOOS=linux",
@@ -182,12 +177,17 @@ func TestTwoTablesStreaming(t *testing.T) {
 		Env: []string{
 			"PORT=4000",
 			"CONFIG_DIR=/config/two-tables",
+			"LOG_LEVEL=debug",
 		},
 		Mounts: []string{
 			fmt.Sprintf("%s:/config/two-tables/systems", systemsHostDir),
 			fmt.Sprintf("%s:/config/two-tables/models", modelsHostDir),
 		},
-		NetworkID: network.Network.ID,
+		NetworkID:    network.Network.ID,
+		ExposedPorts: []string{"4000/tcp"},
+		PortBindings: map[docker.Port][]docker.PortBinding{
+			"4000/tcp": {{HostIP: "0.0.0.0", HostPort: "4000"}},
+		},
 	})
 	if err != nil {
 		t.Fatalf("Could not start resource: %s", err)

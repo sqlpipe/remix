@@ -26,64 +26,53 @@ type Postgresql struct {
 	duplicateChecker map[string][]*app.Object
 }
 
-func newPostgresql(systemInfo SystemInfo) (postgresql Postgresql, err error) {
-	db, err := openConnectionPool(systemInfo.Name, systemInfo.ConnectionString, DriverPostgreSQL)
+func newPostgresql(systemInfo SystemInfo) (Postgresql, error) {
+
+	db, replConn, err := openPostgresConnections(systemInfo)
 	if err != nil {
-		return postgresql, fmt.Errorf("error opening PostgreSQL connection pool :: %v", err)
+		return Postgresql{}, err
 	}
 
-	app.Logger.Info("PostgreSQL connection established", "system", systemInfo.Name)
-
-	// Create replication connection
-	replConn, err := pgconn.Connect(context.Background(), systemInfo.ReplicationDsn)
-	if err != nil {
-		return postgresql, fmt.Errorf("error opening postgresql replication connection :: %v", err)
+	postgresql := Postgresql{
+		db:               db,
+		replConn:         replConn,
+		systemInfo:       systemInfo,
+		limiter:          rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
+		duplicateChecker: make(map[string][]*app.Object),
 	}
-
-	postgresql.db = db
-	postgresql.replConn = replConn
-	postgresql.systemInfo = systemInfo
-	postgresql.limiter = rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize)
-	postgresql.duplicateChecker = make(map[string][]*app.Object)
-
 	for schemaName := range app.SchemaMap {
 		postgresql.duplicateChecker[schemaName] = make([]*app.Object, 0)
 	}
 
-	go postgresql.loop()
-
-	return postgresql, nil
-}
-
-func (p Postgresql) loop() {
-
-	slotName := "sqlpipe_slot"
-	outputPlugin := "wal2json"
-
-	replConn, err := pgconn.Connect(context.Background(), p.systemInfo.ReplicationDsn)
-	if err != nil {
-		app.Logger.Error("failed to connect", "error", err)
-		os.Exit(1)
-	}
-	defer replConn.Close(context.Background())
-
-	sysident, err := pglogrepl.IdentifySystem(context.Background(), replConn)
-	if err != nil {
-		app.Logger.Error("IdentifySystem failed", "error", err)
-		os.Exit(1)
+	if len(systemInfo.ReceiveMixer) == 0 {
+		app.Logger.Info("PostgreSQL initialized in push-only mode (no CDC)", "system", systemInfo.Name)
+		return postgresql, nil
 	}
 
-	_, err = pglogrepl.CreateReplicationSlot(context.Background(), replConn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Temporary: false, Mode: pglogrepl.LogicalReplication})
+	tableList, err := setupPublication(db, systemInfo.PublicationName, systemInfo.ReceiveMixer)
 	if err != nil {
-		// If the error is "already exists", it's OK, otherwise fail
-		if !strings.Contains(err.Error(), "already exists") {
-			app.Logger.Error("CreateReplicationSlot failed", "error", err)
-			os.Exit(1)
-		}
+		return postgresql, fmt.Errorf("error setting up publication: %v", err)
 	}
 
-	pluginArguments := []string{"\"pretty-print\" 'true'"}
-	err = pglogrepl.StartReplication(context.Background(), replConn, slotName, sysident.XLogPos,
+	sysident, err := setupReplicationSlot(replConn, systemInfo.ReplicationSlotName)
+	if err != nil {
+		return postgresql, fmt.Errorf("error setting up replication slot: %v", err)
+	}
+
+	app.Logger.Info("PostgreSQL initialized in CDC mode",
+		"system", systemInfo.Name,
+		"publication", systemInfo.PublicationName,
+		"tables", tableList,
+		"slot", systemInfo.ReplicationSlotName,
+	)
+
+	pluginArguments := []string{}
+
+	if app.Config.LogLevel == "debug" {
+		pluginArguments = append(pluginArguments, "\"pretty-print\" 'true'")
+	}
+
+	err = pglogrepl.StartReplication(context.Background(), replConn, systemInfo.ReplicationSlotName, sysident.XLogPos,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: pluginArguments,
 		})
@@ -92,167 +81,259 @@ func (p Postgresql) loop() {
 		os.Exit(1)
 	}
 
-	clientXLogPos := sysident.XLogPos
+	go postgresql.loop(sysident.XLogPos)
+
+	return postgresql, nil
+}
+
+// Helper to open the main and replication connections
+func openPostgresConnections(systemInfo SystemInfo) (db *sql.DB, replConn *pgconn.PgConn, err error) {
+	db, err = openConnectionPool(systemInfo.Name, systemInfo.ConnectionString, DriverPostgreSQL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error opening PostgreSQL connection pool :: %v", err)
+	}
+
+	app.Logger.Info("PostgreSQL connection established", "system", systemInfo.Name)
+
+	replConn, err = pgconn.Connect(context.Background(), systemInfo.ReplicationDsn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error opening postgresql replication connection :: %v", err)
+	}
+	return db, replConn, nil
+}
+
+// Helper to setup publication
+func setupPublication(db *sql.DB, pubName string, receiveMixer ReceiveMixer) ([]string, error) {
+	if pubName == "" {
+		return nil, fmt.Errorf("publication_name must be set in systemInfo")
+	}
+	dropPubSQL := fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", pubName)
+	_, _ = db.Exec(dropPubSQL)
+
+	tableSet := make(map[string]struct{})
+	for table := range receiveMixer {
+		tableSet[table] = struct{}{}
+	}
+	tableList := make([]string, 0, len(tableSet))
+	for table := range tableSet {
+		tableList = append(tableList, table)
+	}
+
+	if len(tableList) == 0 {
+		return tableList, nil // push-only mode
+	}
+
+	createPubSQL := ""
+	if len(tableList) > 0 {
+		createPubSQL = fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s;", pubName, strings.Join(tableList, ", "))
+	} else {
+		createPubSQL = fmt.Sprintf("CREATE PUBLICATION %s FOR ALL TABLES;", pubName)
+	}
+	_, err := db.Exec(createPubSQL)
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		return nil, fmt.Errorf("failed to create publication: %v", err)
+	}
+	return tableList, nil
+}
+
+// Helper to setup replication slot
+func setupReplicationSlot(replConn *pgconn.PgConn, slotName string) (sysident pglogrepl.IdentifySystemResult, err error) {
+	if slotName == "" {
+		return sysident, fmt.Errorf("replication_slot_name must be set in systemInfo")
+	}
+	sysident, err = pglogrepl.IdentifySystem(context.Background(), replConn)
+	if err != nil {
+		return sysident, fmt.Errorf("IdentifySystem failed: %v", err)
+	}
+	_, err = pglogrepl.CreateReplicationSlot(context.Background(), replConn, slotName, "wal2json", pglogrepl.CreateReplicationSlotOptions{Temporary: false, Mode: pglogrepl.LogicalReplication})
+	if err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return sysident, fmt.Errorf("CreateReplicationSlot failed: %v", err)
+		}
+	}
+	return sysident, nil
+}
+
+// loop continuously processes safe objects from the ObjectStore and applies them to PostgreSQL.
+// It also manages logical replication by handling WAL (Write-Ahead Log) messages from PostgreSQL using the replication connection.
+// The function:
+//   - Applies upsert/delete operations to the database for new objects, avoiding duplicates.
+//   - Sends periodic standby status updates to the PostgreSQL server.
+//   - Receives and processes logical replication messages (CDC events) to keep the system in sync.
+//   - Uses a rate limiter to control the pace of operations.
+//
+// This function is designed to run as a goroutine and will panic if the system is misconfigured or encounters fatal errors.
+func (p Postgresql) loop(startXLogPos pglogrepl.LSN) {
+	clientXLogPos := startXLogPos
 	standbyMessageTimeout := time.Second * 10
 	nextStandbyMessageDeadline := time.Now().Add(standbyMessageTimeout)
-
 	var index int64
+
 	for {
-		// Get the last safe object index for this system
+		// Wait for the rate limiter to allow the next operation
+		err := p.limiter.Wait(context.Background())
+		if err != nil {
+			app.Logger.Warn("error waiting for rate limiter", "error", err, "system", p.systemInfo.Name)
+			continue
+		}
+
+		// Get the last safe object index for this system from the ObjectStore
 		var exists bool
 		index, exists = app.ObjectStore.GetSafeIndexMap(p.systemInfo.Name)
 		if !exists {
 			panic(fmt.Sprintf("safe index not found for system %s", p.systemInfo.Name))
 		}
 
-		// Wait for rate limiter
-		err := p.limiter.Wait(context.Background())
-		if err != nil {
-			// Optionally log or handle error, then break or continue
-			continue
-		}
-
-		// Query safeObjects after lastIndex
-		objects := app.ObjectStore.GetSafeObjectsFromIndex(index)
-		if len(objects) > 0 {
-			// Process new objects as needed
-			index += int64(len(objects))
-		}
-
-		for _, object := range objects {
-
-			b, _ := json.MarshalIndent(object, "", "  ")
-			app.Logger.Debug("PostgreSQL got from queue", "object", string(b))
-
-			searchFields := []string{}
-
-			for locationInSystem, fields := range p.systemInfo.PushMixer[object.Type] {
-				newObj := app.Object{
-					Operation: object.Operation,
-					Type:      object.Type,
-					Payload:   make(map[string]any),
-				}
-				for keyInSchema, location := range fields {
-					if _, ok := object.Payload[keyInSchema]; ok {
-						newObj.Payload[location.Field] = object.Payload[keyInSchema]
-
-						if fields[keyInSchema].SearchKey {
-							searchFields = append(searchFields, location.Field)
-						}
-					}
-				}
-
-				var objectIsDuplicate bool
-				foundDuplicate := false
-				for i, object := range p.duplicateChecker[object.Type] {
-
-					objectIsDuplicate = true
-
-					if object.Operation != object.Operation {
-						objectIsDuplicate = false
-					} else {
-						for k, v := range newObj.Payload {
-							if _, ok := object.Payload[k]; !ok {
-								objectIsDuplicate = false
-								break
-							}
-							if v != object.Payload[k] {
-								objectIsDuplicate = false
-								break
-							}
-						}
-					}
-
-					if objectIsDuplicate {
-						// If we found a duplicate, we can remove it from the duplicate checker
-						p.duplicateChecker[object.Type] = append(p.duplicateChecker[object.Type][:i], p.duplicateChecker[object.Type][i+1:]...)
-						foundDuplicate = true
-						break
-					}
-				}
-
-				app.Logger.Debug("PostgreSQL duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
-
-				if !foundDuplicate {
-					switch newObj.Operation {
-					case "upsert":
-						err = p.upsertJSON(newObj.Payload, searchFields, locationInSystem, newObj.Type, &object)
-						if err != nil {
-							app.Logger.Error("error upserting JSON to PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", object)
-						}
-					case "delete":
-						err = p.deleteFromPostgresql(newObj.Payload, searchFields, locationInSystem, &object)
-						if err != nil {
-							app.Logger.Error("error deleting from PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", newObj)
-						}
-					}
-				}
-
-			}
-		}
+		// --- PUSH: Process objects from the queue ---
+		p.processPushObjects(&index)
 
 		// Update the safe index map for this system
 		app.ObjectStore.SetSafeIndexMap(p.systemInfo.Name, index)
 
-		if time.Now().After(nextStandbyMessageDeadline) {
-			err = pglogrepl.SendStandbyStatusUpdate(context.Background(), replConn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
-			if err != nil {
-				log.Fatalln("SendStandbyStatusUpdate failed:", err)
-			}
-			nextStandbyMessageDeadline = time.Now().Add(standbyMessageTimeout)
-		}
-
-		ctx, cancel := context.WithDeadline(context.Background(), nextStandbyMessageDeadline)
-		rawMsg, err := replConn.ReceiveMessage(ctx)
-		cancel()
+		// --- PULL: Process replication messages (CDC) ---
+		err = p.processReplicationMessage(&clientXLogPos, &nextStandbyMessageDeadline)
 		if err != nil {
-			if pgconn.Timeout(err) {
-				continue
-			}
-			log.Fatalln("ReceiveMessage failed:", err)
-		}
-
-		if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
-			log.Fatalf("received Postgres WAL error: %+v", errMsg)
-		}
-
-		msg, ok := rawMsg.(*pgproto3.CopyData)
-		if !ok {
-			log.Printf("Received unexpected message: %T\n", rawMsg)
-			continue
-		}
-
-		switch msg.Data[0] {
-		case pglogrepl.PrimaryKeepaliveMessageByteID:
-			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
-			if err != nil {
-				log.Fatalln("ParsePrimaryKeepaliveMessage failed:", err)
-			}
-			if pkm.ServerWALEnd > clientXLogPos {
-				clientXLogPos = pkm.ServerWALEnd
-			}
-			if pkm.ReplyRequested {
-				nextStandbyMessageDeadline = time.Time{}
-			}
-
-		case pglogrepl.XLogDataByteID:
-			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
-			if err != nil {
-				log.Fatalln("ParseXLogData failed:", err)
-			}
-
-			err = p.handleCdcEvent(string(xld.WALData))
-			if err != nil {
-				app.Logger.Error("error handling CDC event", "error", err, "data", string(xld.WALData))
-				return
-			}
-
-			if xld.WALStart > clientXLogPos {
-				clientXLogPos = xld.WALStart
-			}
-		default:
+			// If processReplicationMessage returns an error, log and break (fatal)
+			app.Logger.Error("error in replication message processing", "error", err)
+			return
 		}
 	}
+}
+
+// processPushObjects processes safe objects from the ObjectStore and applies them to PostgreSQL.
+func (p Postgresql) processPushObjects(index *int64) {
+	objects := app.ObjectStore.GetSafeObjectsFromIndex(*index)
+	if len(objects) > 0 {
+		*index += int64(len(objects))
+	}
+
+	for _, object := range objects {
+		b, _ := json.MarshalIndent(object, "", "  ")
+		app.Logger.Debug("PostgreSQL got from queue", "object", string(b))
+
+		searchFields := []string{}
+
+		for locationInSystem, fields := range p.systemInfo.PushMixer[object.Type] {
+			newObj := app.Object{
+				Operation: object.Operation,
+				Type:      object.Type,
+				Payload:   make(map[string]any),
+			}
+			for keyInSchema, location := range fields {
+				if _, ok := object.Payload[keyInSchema]; ok {
+					newObj.Payload[location.Field] = object.Payload[keyInSchema]
+					if fields[keyInSchema].SearchKey {
+						searchFields = append(searchFields, location.Field)
+					}
+				}
+			}
+
+			// Duplicate check: see if this object was already processed
+			var objectIsDuplicate bool
+			foundDuplicate := false
+			for i, obj := range p.duplicateChecker[object.Type] {
+				objectIsDuplicate = true
+				if obj.Operation != object.Operation {
+					objectIsDuplicate = false
+				} else {
+					for k, v := range newObj.Payload {
+						if _, ok := obj.Payload[k]; !ok {
+							objectIsDuplicate = false
+							break
+						}
+						if v != obj.Payload[k] {
+							objectIsDuplicate = false
+							break
+						}
+					}
+				}
+				if objectIsDuplicate {
+					p.duplicateChecker[object.Type] = append(p.duplicateChecker[object.Type][:i], p.duplicateChecker[object.Type][i+1:]...)
+					foundDuplicate = true
+					break
+				}
+			}
+
+			app.Logger.Debug("PostgreSQL duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
+
+			if !foundDuplicate {
+				switch newObj.Operation {
+				case "upsert":
+					err := p.upsertJSON(newObj.Payload, searchFields, locationInSystem, newObj.Type, &object)
+					if err != nil {
+						app.Logger.Error("error upserting JSON to PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", object)
+					}
+				case "delete":
+					err := p.deleteFromPostgresql(newObj.Payload, searchFields, locationInSystem, &object)
+					if err != nil {
+						app.Logger.Error("error deleting from PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", newObj)
+					}
+				}
+			}
+		}
+	}
+}
+
+// processReplicationMessage handles standby status updates and incoming replication (CDC) messages.
+func (p Postgresql) processReplicationMessage(clientXLogPos *pglogrepl.LSN, nextStandbyMessageDeadline *time.Time) error {
+	standbyMessageTimeout := time.Second * 10
+	// Send a standby status update to the replication connection if needed
+	if time.Now().After(*nextStandbyMessageDeadline) {
+		err := pglogrepl.SendStandbyStatusUpdate(context.Background(), p.replConn, pglogrepl.StandbyStatusUpdate{WALWritePosition: *clientXLogPos})
+		if err != nil {
+			return fmt.Errorf("SendStandbyStatusUpdate failed: %v", err)
+		}
+		*nextStandbyMessageDeadline = time.Now().Add(standbyMessageTimeout)
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), *nextStandbyMessageDeadline)
+	rawMsg, err := p.replConn.ReceiveMessage(ctx)
+	cancel()
+	if err != nil {
+		if pgconn.Timeout(err) {
+			return nil // Not fatal, just continue
+		}
+		return fmt.Errorf("ReceiveMessage failed: %v", err)
+	}
+
+	if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
+		return fmt.Errorf("received Postgres WAL error: %+v", errMsg)
+	}
+
+	msg, ok := rawMsg.(*pgproto3.CopyData)
+	if !ok {
+		log.Printf("Received unexpected message: %T\n", rawMsg)
+		return nil // Not fatal, just continue
+	}
+
+	switch msg.Data[0] {
+	case pglogrepl.PrimaryKeepaliveMessageByteID:
+		pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+		if err != nil {
+			return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %v", err)
+		}
+		if pkm.ServerWALEnd > *clientXLogPos {
+			*clientXLogPos = pkm.ServerWALEnd
+		}
+		if pkm.ReplyRequested {
+			*nextStandbyMessageDeadline = time.Time{}
+		}
+	case pglogrepl.XLogDataByteID:
+		xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
+		if err != nil {
+			return fmt.Errorf("ParseXLogData failed: %v", err)
+		}
+		err = p.handleCdcEvent(string(xld.WALData))
+		if err != nil {
+			return fmt.Errorf("error handling CDC event: %v", err)
+		}
+		if xld.WALStart > *clientXLogPos {
+			*clientXLogPos = xld.WALStart
+		}
+	default:
+		// Ignore other message types
+	}
+	return nil
 }
 
 func (p Postgresql) HandleWebhook(w http.ResponseWriter, r *http.Request) {

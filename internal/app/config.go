@@ -11,6 +11,7 @@ type config struct {
 		Rps     float64
 		Burst   int
 	}
+	MaxSnapshots int // Maximum number of object store snapshots to keep in debug mode
 }
 
 var Config = &config{}

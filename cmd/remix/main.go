@@ -30,6 +30,8 @@ func main() {
 	flag.Float64Var(&app.Config.Limiter.Rps, "limiter-rps", 25, "Rate limiter maximum requests per second")
 	flag.IntVar(&app.Config.Limiter.Burst, "limiter-burst", 100, "Rate limiter maximum burst")
 
+	flag.IntVar(&app.Config.MaxSnapshots, "max-snapshots", 100, "Maximum number of object store snapshots to keep in debug mode")
+
 	flag.Parse()
 
 	if app.Config.DisplayVersion {

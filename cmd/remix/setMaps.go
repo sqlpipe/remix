@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -22,10 +21,19 @@ func setMaps() error {
 		return fmt.Errorf("failed to find config files: %w", err)
 	}
 
+	app.Logger.Debug(fmt.Sprintf("schema files: %v", schemaFiles))
+	app.Logger.Debug(fmt.Sprintf("system files: %v", systemFiles))
+
 	err = setSchemaMap(schemaFiles)
 	if err != nil {
 		return fmt.Errorf("failed to compile schemas: %w", err)
 	}
+
+	keys := make([]string, 0, len(app.SchemaMap))
+	for k := range app.SchemaMap {
+		keys = append(keys, k)
+	}
+	app.Logger.Debug(fmt.Sprintf("schema map keys: %v", keys))
 
 	err = setSystemMap(systemFiles)
 	if err != nil {
@@ -47,13 +55,11 @@ func findConfigFiles() (schemaFiles []string, systemFiles []string, err error) {
 		}
 		// Add .json files to schemaFiles
 		if strings.HasSuffix(d.Name(), ".json") {
-			app.Logger.Debug("found schema file", "path", path)
 			schemaFiles = append(schemaFiles, path)
 			return nil
 		}
 		// Add .yaml or .yml files to systemFiles
 		if strings.HasSuffix(d.Name(), ".yaml") || strings.HasSuffix(d.Name(), ".yml") {
-			app.Logger.Debug("found system file", "path", path)
 			systemFiles = append(systemFiles, path)
 			return nil
 		}
@@ -85,9 +91,6 @@ func setSchemaMap(schemaFiles []string) error {
 		schemaMap[schema.Title] = schema
 	}
 
-	b, _ := json.MarshalIndent(schemaMap, "", "  ")
-	app.Logger.Debug("Compiled schema map", "schemaMap", string(b))
-
 	app.SchemaMap = schemaMap
 
 	return nil
@@ -117,12 +120,17 @@ func setSystemMap(systemFiles []string) error {
 	}
 
 	for _, systemInfo := range systemInfoMap {
+
+		app.Logger.Debug("initializing new system", "name", systemInfo.Name, "type", systemInfo.Type)
+
 		// Initialize each system and store in the global map
 		system, err := systems.NewSystem(systemInfo)
 		if err != nil {
 			app.Logger.Error("failed to initialize system", "error", err)
 			os.Exit(1)
 		}
+
+		app.Logger.Debug("new system is good to go", "name", systemInfo.Name, "type", systemInfo.Type)
 
 		app.ObjectStore.SetSafeIndexMap(systemInfo.Name, 0)
 
