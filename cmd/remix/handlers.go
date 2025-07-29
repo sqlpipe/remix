@@ -16,7 +16,13 @@ func receiveHandler(w http.ResponseWriter, r *http.Request) {
 		path = path[1:]
 	}
 
-	systems.SystemMap[path].HandleWebhook(w, r)
+	system, ok := systems.SystemMap[path]
+	if !ok {
+		notFoundResponse(w, r)
+		return
+	}
+
+	system.HandleWebhook(w, r)
 }
 
 func healthcheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -36,9 +42,9 @@ func healthcheckHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func debugObjectStoreHistoryHandler(w http.ResponseWriter, r *http.Request) {
+func debugStoreHandler(w http.ResponseWriter, r *http.Request) {
 	env := helpers.Envelope{
-		"object_store_history": app.ObjectStore.GetSnapshotHistory(),
+		"debug_store": app.GetDebugStore(),
 	}
 
 	err := helpers.WriteJSON(w, http.StatusOK, env, nil)

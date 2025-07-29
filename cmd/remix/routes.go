@@ -14,7 +14,7 @@ func routes() http.Handler {
 	router.MethodNotAllowed = http.HandlerFunc(methodNotAllowedResponse)
 
 	router.HandlerFunc(http.MethodGet, "/v1/healthcheck", healthcheckHandler)
-	router.HandlerFunc(http.MethodGet, "/debug/objectStoreHistory", debugObjectStoreHistoryHandler)
+	router.HandlerFunc(http.MethodGet, "/debug/store", debugStoreHandler)
 	router.Handler(http.MethodGet, "/debug/vars", expvar.Handler())
 
 	return metrics(recoverPanic(rateLimit(router)))

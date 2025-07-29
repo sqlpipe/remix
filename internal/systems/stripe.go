@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/sqlpipe/remix/internal/app"
@@ -18,216 +19,242 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// deleteFromStripe simulates deleting an object from Stripe based on the searchKey and searchValue.
-func (s Stripe) deleteFromStripe(endpoint string, object app.Object, searchKey, searchValue string) error {
-	if searchKey == "" || searchValue == "" {
-		return fmt.Errorf("deleteFromStripe: searchKey and searchValue must be provided")
-	}
-
-	b, _ := json.MarshalIndent(object, "", "  ")
-	app.Logger.Debug("Stripe deleting object", "object", string(b))
-
-	baseURL := "https://api.stripe.com/v1"
-	deleteUrl := fmt.Sprintf("%s/%s/%s", baseURL, endpoint, searchValue)
-	req, err := http.NewRequest("DELETE", deleteUrl, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	app.Logger.Debug("Making DELETE request to Stripe", "url", deleteUrl)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to delete object at stripe route %s, error making request: %w", deleteUrl, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body from stripe route %s, error reading response body: %w", deleteUrl, err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("failed to delete object at stripe route %s, status code: %d, response: %s", deleteUrl, resp.StatusCode, string(body))
-	}
-
-	return nil
-}
-
 type Stripe struct {
 	client           *stripe.Client
 	apiKey           string
 	limiter          *rate.Limiter
 	systemInfo       SystemInfo
-	duplicateChecker map[string][]*app.Object
+	seenObjects      map[string][]*app.Object
+	seenObjectsMutex sync.RWMutex
 }
 
 func newStripe(systemInfo SystemInfo) (system SystemInterface, err error) {
-
-	if systemInfo.UseCliListener {
-
-		if _, err := exec.LookPath("stripe"); err != nil {
-			return nil, fmt.Errorf("Stripe CLI not found in PATH. Please install it to use Stripe listening mode: %w", err)
-		}
-
-		// Forward Stripe events to our local endpoint
-		forwardURL := fmt.Sprintf("http://localhost:%d/%v", app.Config.Port, systemInfo.Name)
-		cmd := exec.Command("stripe", "listen", "--forward-to", forwardURL)
-		cmd.Stderr = os.Stderr
-
-		cmd.Env = append(os.Environ(), fmt.Sprintf("STRIPE_API_KEY=%s", systemInfo.ApiKey))
-
-		go func() {
-			app.Logger.Info("Starting Stripe CLI listener", "command", cmd.String())
-			err := cmd.Run()
-			if err != nil {
-				return
-			}
-		}()
+	err = startStripeCliListener(systemInfo)
+	if err != nil {
+		return nil, err
 	}
 
-	stripeClient := stripe.NewClient(systemInfo.ApiKey)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
-
-	listParams := &stripe.CouponListParams{}
-	listParams.Limit = stripe.Int64(1)
-
-	for _, err := range stripeClient.V1Coupons.List(ctx, listParams) {
-		if err != nil {
-			return nil, err
-		}
-
-		break
+	stripeClient, err := newStripeClientWithHealthCheck(systemInfo.ApiKey)
+	if err != nil {
+		return nil, err
 	}
-
-	app.Logger.Debug("Stripe test api call was successful", "system", systemInfo.Name)
 
 	stripeSystem := &Stripe{
-		client:           stripeClient,
-		limiter:          rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
-		systemInfo:       systemInfo,
-		duplicateChecker: make(map[string][]*app.Object),
-		apiKey:           systemInfo.ApiKey,
+		client:      stripeClient,
+		limiter:     rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
+		systemInfo:  systemInfo,
+		seenObjects: make(map[string][]*app.Object),
+		apiKey:      systemInfo.ApiKey,
 	}
 
 	for schemaName := range app.SchemaMap {
-		stripeSystem.duplicateChecker[schemaName] = make([]*app.Object, 0)
+		stripeSystem.seenObjects[schemaName] = make([]*app.Object, 0)
 	}
-
-	app.ObjectStore.SetSafeIndexMap(systemInfo.Name, 0)
 
 	go stripeSystem.watchQueue()
 
 	return stripeSystem, nil
 }
 
-func (s Stripe) watchQueue() {
+// Helper to parse Stripe event type into objectName and operationType
+func parseStripeEventType(eventType string) (objectName, operationType string, err error) {
+	objectName = eventType
+	if idx := indexOfPeriod(objectName); idx > 0 {
+		operationType = objectName[idx+1:]
+		objectName = objectName[:idx]
+	} else {
+		err = fmt.Errorf("event type missing period: %s", eventType)
+		return
+	}
+
+	switch operationType {
+	case "created", "updated":
+		operationType = "upsert"
+	case "deleted":
+		operationType = "delete"
+	default:
+		err = fmt.Errorf("unknown Stripe event type: %s", eventType)
+	}
+	return
+}
+
+func (s *Stripe) HandleWebhook(w http.ResponseWriter, r *http.Request) {
+
+	// Immediately acknowledge receipt to Stripe
+	w.WriteHeader(http.StatusOK)
+
+	var event stripe.Event
+	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+		app.Logger.Error("Failed to decode Stripe event", "error", err)
+		return
+	}
+
+	objectName, operationType, parseErr := parseStripeEventType(string(event.Type))
+	if parseErr != nil {
+		app.Logger.Error(parseErr.Error(), "event_type", event.Type)
+		return
+	}
+
+	var webhookData map[string]any
+	err := json.Unmarshal(event.Data.Raw, &webhookData)
+	if err != nil {
+		app.Logger.Error("Failed to unmarshal Stripe event data", "error", err)
+		return
+	}
+
+	if app.Config.LogLevel == "debug" {
+		app.AddToDebugStore(app.DebugMessage{Payload: webhookData, Operation: "Received webhook", System: s.systemInfo.Name})
+	}
+
+	newObjs := applyReceiveMixer(objectName, operationType, webhookData, s.systemInfo.ReceiveMixer)
+
+	for schemaName, obj := range newObjs {
+
+		// Validate the object using schema and remove nil values
+		err = validateObject(schemaName, obj, objectName)
+		if err != nil {
+			return
+		}
+
+		if s.checkIfSeen(schemaName, obj) {
+			if app.Config.LogLevel == "debug" {
+				app.AddToDebugStore(app.DebugMessage{Payload: obj, Operation: "Inbound duplicate", System: s.systemInfo.Name})
+			}
+			continue
+		}
+
+		if app.Config.LogLevel == "debug" {
+			app.AddToDebugStore(app.DebugMessage{Payload: obj, Operation: "Adding to queue", System: s.systemInfo.Name})
+		}
+
+		app.ObjectStore.AddSafeObject(obj)
+		s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName], &obj)
+	}
+}
+
+// watchQueue is the main loop for processing objects from the queue and applying them to Stripe.
+func (s *Stripe) watchQueue() {
 	var index int64
 	for {
-		// Get the last safe object index for this system
+		if err := s.limiter.Wait(context.Background()); err != nil {
+			continue
+		}
 		var exists bool
 		index, exists = app.ObjectStore.GetSafeIndexMap(s.systemInfo.Name)
 		if !exists {
 			panic(fmt.Sprintf("safe index not found for system %s", s.systemInfo.Name))
 		}
-
-		// Wait for rate limiter
-		err := s.limiter.Wait(context.Background())
-		if err != nil {
-			// Optionally log or handle error, then break or continue
-			continue
-		}
-
-		// Query safeObjects after lastIndex
-		objects := app.ObjectStore.GetSafeObjectsFromIndex(index)
-		if len(objects) > 0 {
-			// Process new objects as needed
-			index += int64(len(objects))
-		}
-
-		for _, object := range objects {
-
-			var searchKey string
-			var searchValue string
-
-			b, _ := json.MarshalIndent(object, "", "  ")
-			app.Logger.Debug("Stripe got object from queue", "object", string(b))
-
-			for locationInSystem, pushLocation := range s.systemInfo.PushMixer[object.Type] {
-				newObj := app.Object{
-					Payload:   make(map[string]any),
-					Operation: object.Operation,
-					Type:      object.Type,
-				}
-				for keyInSchema, field := range pushLocation {
-					if _, ok := object.Payload[keyInSchema]; ok {
-						newObj.Payload[field.Field] = object.Payload[keyInSchema]
-
-						if field.SearchKey {
-							searchKey = field.Field
-							searchValue = fmt.Sprint(newObj.Payload[field.Field])
-						}
-					}
-
-					if field.Hardcode != nil && !helpers.IsZeroValue(field.Hardcode) {
-						newObj.Payload[field.Field] = field.Hardcode
-					}
-				}
-
-				var objectIsDuplicate bool
-				foundDuplicate := false
-				for i, expiringObj := range s.duplicateChecker[object.Type] {
-					objectIsDuplicate = true
-					for k, v := range expiringObj.Payload {
-						if v != object.Payload[k] {
-							objectIsDuplicate = false
-							break
-						}
-					}
-					if objectIsDuplicate {
-						// If we found a duplicate, we can remove it from the duplicate checker
-						s.duplicateChecker[object.Type] = append(s.duplicateChecker[object.Type][:i], s.duplicateChecker[object.Type][i+1:]...)
-						foundDuplicate = true
-						break
-					}
-				}
-
-				app.Logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
-
-				if !foundDuplicate {
-					switch object.Operation {
-					case "upsert":
-						// Upsert the object to Stripe
-						_, err := s.upsertObject(locationInSystem, newObj, object.Type, searchKey, searchValue)
-						if err != nil {
-							app.Logger.Error("Failed to upsert object to Stripe", "error", err, "object", newObj)
-							continue
-						}
-					case "delete":
-						err := s.deleteFromStripe(locationInSystem, newObj, searchKey, searchValue)
-						if err != nil {
-							app.Logger.Error("Failed to delete object from Stripe", "error", err, "object", newObj)
-							continue
-						}
-					}
-				}
-			}
-		}
-
-		// Update the safe index map for this system
+		s.processPushObjects(&index)
 		app.ObjectStore.SetSafeIndexMap(s.systemInfo.Name, index)
 	}
 }
 
+// startStripeCliListener starts the Stripe CLI listener if UseCliListener is enabled.
+func startStripeCliListener(systemInfo SystemInfo) error {
+	if !systemInfo.UseCliListener {
+		return nil
+	}
+
+	if _, err := exec.LookPath("stripe"); err != nil {
+		return fmt.Errorf("Stripe CLI not found in PATH. Please install it to use Stripe listening mode: %w", err)
+	}
+
+	// Forward Stripe events to our local endpoint
+	forwardURL := fmt.Sprintf("http://localhost:%d/%v", app.Config.Port, systemInfo.Name)
+	cmd := exec.Command("stripe", "listen", "--forward-to", forwardURL)
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(), fmt.Sprintf("STRIPE_API_KEY=%s", systemInfo.ApiKey))
+	go func() {
+		app.Logger.Info("Starting Stripe CLI listener", "command", cmd.String())
+		err := cmd.Run()
+		if err != nil {
+			return
+		}
+	}()
+	return nil
+}
+
+// newStripeClientWithHealthCheck creates a new Stripe client and performs a health check by listing coupons.
+func newStripeClientWithHealthCheck(apiKey string) (*stripe.Client, error) {
+	stripeClient := stripe.NewClient(apiKey)
+
+	listParams := &stripe.CouponListParams{}
+	listParams.Limit = stripe.Int64(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+	for _, err := range stripeClient.V1Coupons.List(ctx, listParams) {
+		if err != nil {
+			return nil, err
+		}
+		break
+	}
+
+	return stripeClient, nil
+}
+
+// processPushObjects processes safe objects from the ObjectStore and applies them to Stripe.
+func (s *Stripe) processPushObjects(index *int64) {
+	objects := app.ObjectStore.GetSafeObjectsFromIndex(*index)
+	if len(objects) > 0 {
+		*index += int64(len(objects))
+		if app.Config.LogLevel == "debug" {
+			app.AddToDebugStore(app.DebugMessage{Payload: objects, Operation: "Got from queue", System: s.systemInfo.Name})
+		}
+	}
+
+	for _, object := range objects {
+		var searchKey, searchValue string
+		for locationInSystem, pushLocation := range s.systemInfo.PushMixer[object.Type] {
+			newObj := app.Object{
+				Payload:   make(map[string]any),
+				Operation: object.Operation,
+				Type:      object.Type,
+			}
+			for keyInSchema, field := range pushLocation {
+				if _, ok := object.Payload[keyInSchema]; ok {
+					newObj.Payload[field.Field] = object.Payload[keyInSchema]
+					if field.SearchKey {
+						searchKey = field.Field
+						searchValue = fmt.Sprint(newObj.Payload[field.Field])
+					}
+				}
+				if field.Hardcode != nil && !helpers.IsZeroValue(field.Hardcode) {
+					newObj.Payload[field.Field] = field.Hardcode
+				}
+			}
+
+			if !s.checkIfSeen(object.Type, newObj) {
+				s.processStripeOperation(locationInSystem, newObj, searchKey, searchValue)
+			}
+		}
+	}
+}
+
+// processStripeOperation dispatches upsert or delete operations to Stripe.
+func (s *Stripe) processStripeOperation(locationInSystem string, object app.Object, searchKey, searchValue string) {
+	switch object.Operation {
+	case "upsert":
+		_, err := s.upsertObject(locationInSystem, object, object.Type, searchKey, searchValue)
+		if err != nil {
+			app.Logger.Error("Failed to upsert object to Stripe", "error", err, "object", object)
+		}
+	case "delete":
+		err := s.deleteFromStripe(locationInSystem, searchKey, searchValue)
+		if err != nil {
+			app.Logger.Error("Failed to delete object from Stripe", "error", err, "object", object)
+		}
+	}
+}
+
+// processStripeOperation dispatches upsert or delete operations to Stripe.
 func (s Stripe) upsertObject(endpoint string, object app.Object, objectType string, searchKey, searchValue string) ([]byte, error) {
 	// Replace with your actual secret key or use an environment variable
 	form := url.Values{}
 
-	b, _ := json.MarshalIndent(object, "", "  ")
-	app.Logger.Debug("Stripe upserting object", "object", string(b))
+	if app.Config.LogLevel == "debug" {
+		app.AddToDebugStore(app.DebugMessage{Payload: object, Operation: "Upserting into", System: s.systemInfo.Name})
+	}
 
 	for key, value := range object.Payload {
 
@@ -321,128 +348,7 @@ func (s Stripe) upsertObject(endpoint string, object app.Object, objectType stri
 	}
 	s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], newObject)
 
-	b, _ = json.MarshalIndent(object, "", "  ")
-	app.Logger.Debug("Stripe added to queue and duplicate checker", "object", string(b))
-
 	return body, nil
-}
-
-func (s *Stripe) HandleWebhook(w http.ResponseWriter, r *http.Request) {
-
-	// Immediately acknowledge receipt to Stripe
-	w.WriteHeader(http.StatusOK)
-	var err error
-
-	var event stripe.Event
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-		app.Logger.Error("Failed to decode Stripe event", "error", err)
-		return
-	}
-
-	app.Logger.Debug("Received Stripe event", "event_type", event.Type)
-
-	objectName := string(event.Type)
-	var operationType string
-	// If the event type contains a period, we only want the part before it
-	if idx := indexOfPeriod(objectName); idx > 0 {
-		operationType = objectName[idx+1:]
-		objectName = objectName[:idx]
-	}
-
-	switch operationType {
-	case "created", "updated":
-		operationType = "upsert"
-	case "deleted":
-		operationType = "delete"
-	default:
-		app.Logger.Error("Unknown Stripe event type", "event_type", event.Type)
-		return
-	}
-
-	var obj map[string]any
-	err = json.Unmarshal(event.Data.Raw, &obj)
-	if err != nil {
-		app.Logger.Error("Failed to unmarshal Stripe event data", "error", err)
-		return
-	}
-
-	b, _ := json.MarshalIndent(obj, "", "  ")
-	app.Logger.Debug("Stripe received object", "object", string(b))
-
-	newObjs := make(map[string]map[string]any)
-
-	for schemaName, fields := range s.systemInfo.ReceiveMixer[objectName] {
-		newModel := map[string]any{}
-
-		for keyInObj, field := range fields {
-			if field.Hardcode != nil && !helpers.IsZeroValue(field.Hardcode) {
-				newModel[field.Field] = field.Hardcode
-			} else {
-				newModel[field.Field] = helpers.GetNestedValue(obj, keyInObj)
-			}
-		}
-
-		newObjs[schemaName] = newModel
-	}
-
-	for schemaName, obj := range newObjs {
-
-		schema, inMap := app.SchemaMap[schemaName]
-		if !inMap {
-			fmt.Printf("No schema found for object: %s\n", objectName)
-			return
-		}
-
-		for k, v := range obj {
-			if v == nil {
-				delete(obj, k)
-			}
-		}
-
-		err = schema.Validate(obj)
-		if err != nil {
-			fmt.Printf("Object failed stripe schema validation for '%s': %v\n", objectName, err)
-			return
-		}
-
-		var objectIsDuplicate bool
-		foundDuplicate := false
-		for i, expiringObj := range s.duplicateChecker[schemaName] {
-
-			objectIsDuplicate = true
-
-			for k, v := range obj {
-				if v != expiringObj.Payload[k] {
-					objectIsDuplicate = false
-					break
-				}
-			}
-
-			if objectIsDuplicate {
-
-				// If we found a duplicate, we can remove it from the duplicate checker
-				s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName][:i], s.duplicateChecker[schemaName][i+1:]...)
-				foundDuplicate = true
-				break
-			}
-		}
-
-		app.Logger.Debug("Stripe duplicate check result", "isDuplicate", objectIsDuplicate, "object", obj)
-
-		if !foundDuplicate {
-
-			object := app.Object{
-				Type:      schemaName,
-				Operation: operationType,
-				Payload:   obj,
-			}
-
-			app.ObjectStore.AddSafeObject(object)
-			s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName], &object)
-
-			app.Logger.Debug("Stripe added to queue and duplicate checker", "object", object)
-		}
-	}
 }
 
 // indexOfPeriod returns the index of the first period in s, or -1 if not found
@@ -454,3 +360,72 @@ func indexOfPeriod(s string) int {
 	}
 	return -1
 }
+
+// deleteFromStripe simulates deleting an object from Stripe based on the searchKey and searchValue.
+func (s Stripe) deleteFromStripe(endpoint string, searchKey, searchValue string) error {
+	if searchKey == "" || searchValue == "" {
+		return fmt.Errorf("deleteFromStripe: searchKey and searchValue must be provided")
+	}
+
+	if app.Config.LogLevel == "debug" {
+		app.AddToDebugStore(app.DebugMessage{Payload: searchValue, Operation: "Deleting from", System: s.systemInfo.Name})
+	}
+
+	baseURL := "https://api.stripe.com/v1"
+	deleteUrl := fmt.Sprintf("%s/%s/%s", baseURL, endpoint, searchValue)
+	req, err := http.NewRequest("DELETE", deleteUrl, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to delete object at stripe route %s, error making request: %w", deleteUrl, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body from stripe route %s, error reading response body: %w", deleteUrl, err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("failed to delete object at stripe route %s, status code: %d, response: %s", deleteUrl, resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// checkInboundObjectForDuplicate checks if the inbound object is a duplicate and removes it if found.
+func (s *Stripe) checkIfSeen(schemaName string, obj app.Object) bool {
+	for i := len(s.duplicateChecker[schemaName]) - 1; i >= 0; i-- {
+		seenObject := s.duplicateChecker[schemaName][i]
+		for k, v := range obj.Payload {
+			if v != seenObject.Payload[k] {
+				break
+			}
+		}
+	}
+
+	return false
+}
+
+// func (s *Stripe) checkOutboundObjectForDuplicate(schemaName string, obj app.Object) bool {
+// 	var objectIsDuplicate bool
+// 	for i, seenObject := range s.duplicateChecker[schemaName] {
+// 		objectIsDuplicate = true
+// 		for k, v := range obj.Payload {
+// 			if v != seenObject.Payload[k] {
+// 				objectIsDuplicate = false
+// 				break
+// 			}
+// 		}
+// 		if objectIsDuplicate {
+// 			s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName][:i], s.duplicateChecker[schemaName][i+1:]...)
+// 			return true
+// 		}
+// 	}
+// 	return false
+// }

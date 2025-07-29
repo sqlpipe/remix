@@ -29,12 +29,6 @@ func setMaps() error {
 		return fmt.Errorf("failed to compile schemas: %w", err)
 	}
 
-	keys := make([]string, 0, len(app.SchemaMap))
-	for k := range app.SchemaMap {
-		keys = append(keys, k)
-	}
-	app.Logger.Debug(fmt.Sprintf("schema map keys: %v", keys))
-
 	err = setSystemMap(systemFiles)
 	if err != nil {
 		return fmt.Errorf("failed to set system map: %w", err)
@@ -123,16 +117,14 @@ func setSystemMap(systemFiles []string) error {
 
 		app.Logger.Debug("initializing new system", "name", systemInfo.Name, "type", systemInfo.Type)
 
+		app.ObjectStore.SetSafeIndexMap(systemInfo.Name, 0)
+
 		// Initialize each system and store in the global map
 		system, err := systems.NewSystem(systemInfo)
 		if err != nil {
 			app.Logger.Error("failed to initialize system", "error", err)
 			os.Exit(1)
 		}
-
-		app.Logger.Debug("new system is good to go", "name", systemInfo.Name, "type", systemInfo.Type)
-
-		app.ObjectStore.SetSafeIndexMap(systemInfo.Name, 0)
 
 		systems.SystemMap[systemInfo.Name] = system
 	}

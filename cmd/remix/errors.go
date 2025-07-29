@@ -42,3 +42,8 @@ func rateLimitExceededResponse(w http.ResponseWriter, r *http.Request) {
 	message := "rate limit exceeded"
 	errorResponse(w, r, http.StatusTooManyRequests, message)
 }
+
+func notFoundResponse(w http.ResponseWriter, r *http.Request) {
+	message := "the requested resource could not be found"
+	errorResponse(w, r, http.StatusNotFound, message)
+}

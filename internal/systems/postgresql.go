@@ -28,6 +28,10 @@ type Postgresql struct {
 
 func newPostgresql(systemInfo SystemInfo) (Postgresql, error) {
 
+	if len(systemInfo.PushMixer) == 0 && len(systemInfo.ReceiveMixer) == 0 {
+		return Postgresql{}, fmt.Errorf("systemInfo must have at least one of PushMixer or ReceiveMixer configured")
+	}
+
 	db, replConn, err := openPostgresConnections(systemInfo)
 	if err != nil {
 		return Postgresql{}, err
@@ -46,6 +50,7 @@ func newPostgresql(systemInfo SystemInfo) (Postgresql, error) {
 
 	if len(systemInfo.ReceiveMixer) == 0 {
 		app.Logger.Info("PostgreSQL initialized in push-only mode (no CDC)", "system", systemInfo.Name)
+		go postgresql.loop(0)
 		return postgresql, nil
 	}
 
@@ -185,17 +190,24 @@ func (p Postgresql) loop(startXLogPos pglogrepl.LSN) {
 		}
 
 		// --- PUSH: Process objects from the queue ---
-		p.processPushObjects(&index)
+		if p.systemInfo.PushMixer != nil {
+			prevIndex := index
+			p.processPushObjects(&index)
 
-		// Update the safe index map for this system
-		app.ObjectStore.SetSafeIndexMap(p.systemInfo.Name, index)
+			// Update the safe index map for this system only if index has incremented
+			if index != prevIndex {
+				app.ObjectStore.SetSafeIndexMap(p.systemInfo.Name, index)
+			}
+		}
 
 		// --- PULL: Process replication messages (CDC) ---
-		err = p.processReplicationMessage(&clientXLogPos, &nextStandbyMessageDeadline)
-		if err != nil {
-			// If processReplicationMessage returns an error, log and break (fatal)
-			app.Logger.Error("error in replication message processing", "error", err)
-			return
+		if p.systemInfo.ReceiveMixer != nil {
+			err = p.processReplicationMessage(&clientXLogPos, &nextStandbyMessageDeadline)
+			if err != nil {
+				// If processReplicationMessage returns an error, log and break (fatal)
+				app.Logger.Error("error in replication message processing", "error", err)
+				return
+			}
 		}
 	}
 }
@@ -205,11 +217,12 @@ func (p Postgresql) processPushObjects(index *int64) {
 	objects := app.ObjectStore.GetSafeObjectsFromIndex(*index)
 	if len(objects) > 0 {
 		*index += int64(len(objects))
+		if app.Config.LogLevel == "debug" {
+			app.AddToDebugStore(app.DebugMessage{Payload: objects, Operation: "Got from queue", System: p.systemInfo.Name})
+		}
 	}
 
 	for _, object := range objects {
-		b, _ := json.MarshalIndent(object, "", "  ")
-		app.Logger.Debug("PostgreSQL got from queue", "object", string(b))
 
 		searchFields := []string{}
 
@@ -229,32 +242,7 @@ func (p Postgresql) processPushObjects(index *int64) {
 			}
 
 			// Duplicate check: see if this object was already processed
-			var objectIsDuplicate bool
-			foundDuplicate := false
-			for i, obj := range p.duplicateChecker[object.Type] {
-				objectIsDuplicate = true
-				if obj.Operation != object.Operation {
-					objectIsDuplicate = false
-				} else {
-					for k, v := range newObj.Payload {
-						if _, ok := obj.Payload[k]; !ok {
-							objectIsDuplicate = false
-							break
-						}
-						if v != obj.Payload[k] {
-							objectIsDuplicate = false
-							break
-						}
-					}
-				}
-				if objectIsDuplicate {
-					p.duplicateChecker[object.Type] = append(p.duplicateChecker[object.Type][:i], p.duplicateChecker[object.Type][i+1:]...)
-					foundDuplicate = true
-					break
-				}
-			}
-
-			app.Logger.Debug("PostgreSQL duplicate check result", "isDuplicate", objectIsDuplicate, "object", newObj)
+			foundDuplicate := p.isDuplicate(object.Type, object.Operation, newObj.Payload)
 
 			if !foundDuplicate {
 				switch newObj.Operation {
@@ -272,6 +260,34 @@ func (p Postgresql) processPushObjects(index *int64) {
 			}
 		}
 	}
+}
+
+// Helper to check for duplicate objects and remove them if found
+func (p *Postgresql) isDuplicate(objectType, operation string, payload map[string]any) bool {
+	objs := p.duplicateChecker[objectType]
+	for i, obj := range objs {
+		objectIsDuplicate := true
+		if obj.Operation != operation {
+			objectIsDuplicate = false
+		} else {
+			for k, v := range payload {
+				if obj.Payload == nil {
+					objectIsDuplicate = false
+					break
+				}
+				if objVal, ok := obj.Payload[k]; !ok || v != objVal {
+					objectIsDuplicate = false
+					break
+				}
+			}
+		}
+		if objectIsDuplicate {
+			// Remove the duplicate from the slice
+			p.duplicateChecker[objectType] = append(objs[:i], objs[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // processReplicationMessage handles standby status updates and incoming replication (CDC) messages.
@@ -342,8 +358,9 @@ func (p Postgresql) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locationInSystem string, objectType string, originalObj *app.Object) error {
 
-	b, _ := json.MarshalIndent(data, "", "  ")
-	app.Logger.Debug("Upserting to PostgreSQL", "data", string(b))
+	if app.Config.LogLevel == "debug" {
+		app.AddToDebugStore(app.DebugMessage{Payload: data, Operation: "Upserting into", System: p.systemInfo.Name})
+	}
 
 	var foundMatch bool
 	var conflictField string
@@ -431,9 +448,6 @@ func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locat
 	}
 	p.duplicateChecker[objectType] = append(p.duplicateChecker[objectType], object)
 
-	b, _ = json.MarshalIndent(originalObj, "", "  ")
-	app.Logger.Debug("PostgreSQL added to duplicate checker", "object", string(b))
-
 	return nil
 }
 
@@ -464,7 +478,9 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 		return fmt.Errorf("error unmarshalling CDC event: %v", err)
 	}
 
-	app.Logger.Debug("PostgreSQL received CDC event", "event", jsonString)
+	if app.Config.LogLevel == "debug" {
+		app.AddToDebugStore(app.DebugMessage{Payload: event, Operation: "Received CDC events", System: p.systemInfo.Name})
+	}
 
 	for _, change := range event.Change {
 		pullLocation := change.Schema + "." + change.Table
@@ -554,8 +570,6 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 				}
 			}
 
-			app.Logger.Debug("PostgreSQL duplicate check result", "isDuplicate", objectIsDuplicate, "object", obj)
-
 			if !foundDuplicate {
 
 				object := app.Object{
@@ -567,6 +581,10 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 				// also add to storage engine
 				app.ObjectStore.AddSafeObject(object)
 
+				if app.Config.LogLevel == "debug" {
+					app.AddToDebugStore(app.DebugMessage{Payload: object, Operation: "Adding to queue", System: p.systemInfo.Name})
+				}
+
 				expiringObj := app.Object{
 					Operation: operationType,
 					Type:      schemaName,
@@ -574,7 +592,6 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 				}
 				p.duplicateChecker[schemaName] = append(p.duplicateChecker[schemaName], &expiringObj)
 
-				app.Logger.Debug("PostgreSQL added to queue and duplicate checker", "object", object)
 			}
 		}
 	}
@@ -585,11 +602,12 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 // deleteFromPostgresql deletes a row from PostgreSQL based on the searchFields and payload.
 func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []string, locationInSystem string, originalObj *app.Object) error {
 
-	b, _ := json.MarshalIndent(payload, "", "  ")
-	app.Logger.Debug("Deleting from PostgreSQL", "payload", string(b))
-
 	if len(searchFields) == 0 {
 		return fmt.Errorf("no search fields provided for delete operation")
+	}
+
+	if app.Config.LogLevel == "debug" {
+		app.AddToDebugStore(app.DebugMessage{Payload: payload, Operation: "Deleting from", System: p.systemInfo.Name})
 	}
 
 	whereClauses := make([]string, 0, len(searchFields))
@@ -618,9 +636,6 @@ func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []
 		Payload:   payload,
 	}
 	p.duplicateChecker[originalObj.Type] = append(p.duplicateChecker[originalObj.Type], &expiringObj)
-
-	b, _ = json.MarshalIndent(originalObj, "", "  ")
-	app.Logger.Debug("PostgreSQL added to duplicate checker", "object", string(b))
 
 	return nil
 }

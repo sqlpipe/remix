@@ -76,10 +76,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	b, _ := json.MarshalIndent(app.SchemaMap, "", "  ")
-	app.Logger.Debug("Set schema map", "schemaMap", string(b))
+	keys := make([]string, 0, len(app.SchemaMap))
+	for k := range app.SchemaMap {
+		keys = append(keys, k)
+	}
+	app.Logger.Debug(fmt.Sprintf("schema map keys: %v", keys))
 
-	b, _ = json.MarshalIndent(systems.SystemMap, "", "  ")
+	b, _ := json.MarshalIndent(systems.SystemMap, "", "  ")
 	app.Logger.Debug("Set system map", "systemMap", string(b))
 
 	app.Logger.Info("Starting remix API server", "port", app.Config.Port)
