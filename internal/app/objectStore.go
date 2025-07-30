@@ -5,37 +5,37 @@ import (
 )
 
 type Object struct {
-	Type      string         `json:"type"`
+	Schema    string         `json:"schema"`
 	Operation string         `json:"operation"`
 	Payload   map[string]any `json:"payload"`
 }
 
-type objectStore struct {
+type objectQueue struct {
 	safeIndexMap map[string]int64
 	indexMapMu   sync.RWMutex
 	safeObjects  []Object
 	objectsMu    sync.RWMutex
 }
 
-var ObjectStore = &objectStore{
+var ObjectQueue = &objectQueue{
 	safeIndexMap: make(map[string]int64),
 	safeObjects:  make([]Object, 0),
 }
 
-func (s *objectStore) GetSafeIndexMap(key string) (int64, bool) {
+func (s *objectQueue) GetSafeIndexMap(key string) (int64, bool) {
 	s.indexMapMu.RLock()
 	defer s.indexMapMu.RUnlock()
 	index, exists := s.safeIndexMap[key]
 	return index, exists
 }
 
-func (s *objectStore) SetSafeIndexMap(key string, index int64) {
+func (s *objectQueue) SetSafeIndexMap(key string, index int64) {
 	s.indexMapMu.Lock()
 	defer s.indexMapMu.Unlock()
 	s.safeIndexMap[key] = index
 }
 
-func (s *objectStore) GetSafeObjectsFromIndex(index int64) []Object {
+func (s *objectQueue) GetSafeObjectsFromIndex(index int64) []Object {
 	s.objectsMu.RLock()
 	defer s.objectsMu.RUnlock()
 
@@ -47,14 +47,14 @@ func (s *objectStore) GetSafeObjectsFromIndex(index int64) []Object {
 	return s.safeObjects[index:]
 }
 
-func (s *objectStore) AddSafeObject(object Object) {
+func (s *objectQueue) AddSafeObject(object Object) {
 	s.objectsMu.Lock()
 	defer s.objectsMu.Unlock()
 	s.safeObjects = append(s.safeObjects, object)
 }
 
-// ObjectStoreState represents a snapshot of the object store's state for debugging or inspection.
-type ObjectStoreState struct {
+// ObjectQueueState represents a snapshot of the object store's state for debugging or inspection.
+type ObjectQueueState struct {
 	SafeIndexMap map[string]int64 `json:"safe_index_map"`
 	SafeObjects  []Object         `json:"safe_objects"`
 }

@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"sync"
 	"time"
 
 	"github.com/sqlpipe/remix/internal/app"
@@ -20,12 +19,10 @@ import (
 )
 
 type Stripe struct {
-	client           *stripe.Client
-	apiKey           string
-	limiter          *rate.Limiter
-	systemInfo       SystemInfo
-	seenObjects      map[string][]*app.Object
-	seenObjectsMutex sync.RWMutex
+	client     *stripe.Client
+	apiKey     string
+	limiter    *rate.Limiter
+	systemInfo SystemInfo
 }
 
 func newStripe(systemInfo SystemInfo) (system SystemInterface, err error) {
@@ -40,15 +37,10 @@ func newStripe(systemInfo SystemInfo) (system SystemInterface, err error) {
 	}
 
 	stripeSystem := &Stripe{
-		client:      stripeClient,
-		limiter:     rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
-		systemInfo:  systemInfo,
-		seenObjects: make(map[string][]*app.Object),
-		apiKey:      systemInfo.ApiKey,
-	}
-
-	for schemaName := range app.SchemaMap {
-		stripeSystem.seenObjects[schemaName] = make([]*app.Object, 0)
+		client:     stripeClient,
+		limiter:    rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
+		systemInfo: systemInfo,
+		apiKey:     systemInfo.ApiKey,
 	}
 
 	go stripeSystem.watchQueue()
@@ -116,7 +108,7 @@ func (s *Stripe) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if s.checkIfSeen(schemaName, obj) {
+		if app.DuplicateChecker.CheckIfSeen(&obj) {
 			if app.Config.LogLevel == "debug" {
 				app.AddToDebugStore(app.DebugMessage{Payload: obj, Operation: "Inbound duplicate", System: s.systemInfo.Name})
 			}
@@ -127,8 +119,8 @@ func (s *Stripe) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			app.AddToDebugStore(app.DebugMessage{Payload: obj, Operation: "Adding to queue", System: s.systemInfo.Name})
 		}
 
-		app.ObjectStore.AddSafeObject(obj)
-		s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName], &obj)
+		app.ObjectQueue.AddSafeObject(obj)
+		app.DuplicateChecker.AddObject(&obj)
 	}
 }
 
@@ -140,12 +132,12 @@ func (s *Stripe) watchQueue() {
 			continue
 		}
 		var exists bool
-		index, exists = app.ObjectStore.GetSafeIndexMap(s.systemInfo.Name)
+		index, exists = app.ObjectQueue.GetSafeIndexMap(s.systemInfo.Name)
 		if !exists {
 			panic(fmt.Sprintf("safe index not found for system %s", s.systemInfo.Name))
 		}
 		s.processPushObjects(&index)
-		app.ObjectStore.SetSafeIndexMap(s.systemInfo.Name, index)
+		app.ObjectQueue.SetSafeIndexMap(s.systemInfo.Name, index)
 	}
 }
 
@@ -193,9 +185,9 @@ func newStripeClientWithHealthCheck(apiKey string) (*stripe.Client, error) {
 	return stripeClient, nil
 }
 
-// processPushObjects processes safe objects from the ObjectStore and applies them to Stripe.
+// processPushObjects processes safe objects from the ObjectQueue and applies them to Stripe.
 func (s *Stripe) processPushObjects(index *int64) {
-	objects := app.ObjectStore.GetSafeObjectsFromIndex(*index)
+	objects := app.ObjectQueue.GetSafeObjectsFromIndex(*index)
 	if len(objects) > 0 {
 		*index += int64(len(objects))
 		if app.Config.LogLevel == "debug" {
@@ -205,11 +197,11 @@ func (s *Stripe) processPushObjects(index *int64) {
 
 	for _, object := range objects {
 		var searchKey, searchValue string
-		for locationInSystem, pushLocation := range s.systemInfo.PushMixer[object.Type] {
+		for locationInSystem, pushLocation := range s.systemInfo.PushMixer[object.Schema] {
 			newObj := app.Object{
 				Payload:   make(map[string]any),
 				Operation: object.Operation,
-				Type:      object.Type,
+				Schema:    object.Schema,
 			}
 			for keyInSchema, field := range pushLocation {
 				if _, ok := object.Payload[keyInSchema]; ok {
@@ -224,7 +216,7 @@ func (s *Stripe) processPushObjects(index *int64) {
 				}
 			}
 
-			if !s.checkIfSeen(object.Type, newObj) {
+			if !app.DuplicateChecker.CheckIfSeen(&newObj) {
 				s.processStripeOperation(locationInSystem, newObj, searchKey, searchValue)
 			}
 		}
@@ -235,7 +227,7 @@ func (s *Stripe) processPushObjects(index *int64) {
 func (s *Stripe) processStripeOperation(locationInSystem string, object app.Object, searchKey, searchValue string) {
 	switch object.Operation {
 	case "upsert":
-		_, err := s.upsertObject(locationInSystem, object, object.Type, searchKey, searchValue)
+		_, err := s.upsertObject(locationInSystem, object, object.Schema, searchKey, searchValue)
 		if err != nil {
 			app.Logger.Error("Failed to upsert object to Stripe", "error", err, "object", object)
 		}
@@ -248,7 +240,7 @@ func (s *Stripe) processStripeOperation(locationInSystem string, object app.Obje
 }
 
 // processStripeOperation dispatches upsert or delete operations to Stripe.
-func (s Stripe) upsertObject(endpoint string, object app.Object, objectType string, searchKey, searchValue string) ([]byte, error) {
+func (s Stripe) upsertObject(endpoint string, object app.Object, objectSchema string, searchKey, searchValue string) ([]byte, error) {
 	// Replace with your actual secret key or use an environment variable
 	form := url.Values{}
 
@@ -312,11 +304,11 @@ func (s Stripe) upsertObject(endpoint string, object app.Object, objectType stri
 		}
 
 		newObject := &app.Object{
-			Type:      objectType,
+			Schema:    objectSchema,
 			Operation: object.Operation,
 			Payload:   object.Payload,
 		}
-		s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], newObject)
+		app.DuplicateChecker.AddObject(newObject)
 		return body, nil
 	}
 
@@ -342,11 +334,11 @@ func (s Stripe) upsertObject(endpoint string, object app.Object, objectType stri
 	}
 
 	newObject := &app.Object{
-		Type:      objectType,
+		Schema:    objectSchema,
 		Operation: object.Operation,
 		Payload:   object.Payload,
 	}
-	s.duplicateChecker[objectType] = append(s.duplicateChecker[objectType], newObject)
+	app.DuplicateChecker.AddObject(newObject)
 
 	return body, nil
 }
@@ -397,35 +389,3 @@ func (s Stripe) deleteFromStripe(endpoint string, searchKey, searchValue string)
 
 	return nil
 }
-
-// checkInboundObjectForDuplicate checks if the inbound object is a duplicate and removes it if found.
-func (s *Stripe) checkIfSeen(schemaName string, obj app.Object) bool {
-	for i := len(s.duplicateChecker[schemaName]) - 1; i >= 0; i-- {
-		seenObject := s.duplicateChecker[schemaName][i]
-		for k, v := range obj.Payload {
-			if v != seenObject.Payload[k] {
-				break
-			}
-		}
-	}
-
-	return false
-}
-
-// func (s *Stripe) checkOutboundObjectForDuplicate(schemaName string, obj app.Object) bool {
-// 	var objectIsDuplicate bool
-// 	for i, seenObject := range s.duplicateChecker[schemaName] {
-// 		objectIsDuplicate = true
-// 		for k, v := range obj.Payload {
-// 			if v != seenObject.Payload[k] {
-// 				objectIsDuplicate = false
-// 				break
-// 			}
-// 		}
-// 		if objectIsDuplicate {
-// 			s.duplicateChecker[schemaName] = append(s.duplicateChecker[schemaName][:i], s.duplicateChecker[schemaName][i+1:]...)
-// 			return true
-// 		}
-// 	}
-// 	return false
-// }

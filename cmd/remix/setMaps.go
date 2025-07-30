@@ -10,6 +10,8 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"gopkg.in/yaml.v3"
 
+	"encoding/json"
+
 	"github.com/sqlpipe/remix/internal/app"
 	"github.com/sqlpipe/remix/internal/systems"
 )
@@ -66,27 +68,70 @@ func findConfigFiles() (schemaFiles []string, systemFiles []string, err error) {
 	return schemaFiles, systemFiles, nil
 }
 
+// readRawSchema reads and decodes the JSON schema file.
+func readRawSchema(path string) (map[string]interface{}, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open schema file %s: %w", path, err)
+	}
+	defer file.Close()
+
+	var raw map[string]interface{}
+	if err := json.NewDecoder(file).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("failed to decode schema file %s: %w", path, err)
+	}
+	return raw, nil
+}
+
+// extractSearchKeys extracts the search_keys field as a []string.
+func extractSearchKeys(raw map[string]interface{}) []string {
+	var searchKeys []string
+	if keys, ok := raw["search_keys"].([]interface{}); ok {
+		for _, k := range keys {
+			if s, ok := k.(string); ok {
+				searchKeys = append(searchKeys, s)
+			}
+		}
+	}
+	return searchKeys
+}
+
+// compileValidator compiles the schema file and returns the validator.
+func compileValidator(path string, compiler *jsonschema.Compiler) (*jsonschema.Schema, error) {
+	url := "file://" + filepath.ToSlash(path)
+	validator, err := compiler.Compile(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile schema at path %s: %w", path, err)
+	}
+	if validator.Title == "" {
+		return nil, fmt.Errorf("schema at path %s has no title", path)
+	}
+	return validator, nil
+}
+
 // setSchemaMap compiles all JSON schema files and populates app.SchemaMap.
 func setSchemaMap(schemaFiles []string) error {
-	schemaMap := map[string]*jsonschema.Schema{}
 	compiler := jsonschema.NewCompiler()
 
 	for _, path := range schemaFiles {
-		url := "file://" + filepath.ToSlash(path)
-		schema, err := compiler.Compile(url)
+		raw, err := readRawSchema(path)
 		if err != nil {
-			return fmt.Errorf("failed to compile schema at path %s: %w", path, err)
+			return err
 		}
-
-		if schema.Title == "" {
-			return fmt.Errorf("schema at path %s has no title", path)
+		searchKeys := extractSearchKeys(raw)
+		validator, err := compileValidator(path, compiler)
+		if err != nil {
+			return err
 		}
-
-		schemaMap[schema.Title] = schema
+		if len(searchKeys) == 0 {
+			return fmt.Errorf("schema at path %s (title: %s) must have at least one search key", path, validator.Title)
+		}
+		app.SchemaMap[validator.Title] = app.Schema{
+			Title:      validator.Title,
+			SearchKeys: searchKeys,
+			Validator:  validator,
+		}
 	}
-
-	app.SchemaMap = schemaMap
-
 	return nil
 }
 
@@ -117,7 +162,7 @@ func setSystemMap(systemFiles []string) error {
 
 		app.Logger.Debug("initializing new system", "name", systemInfo.Name, "type", systemInfo.Type)
 
-		app.ObjectStore.SetSafeIndexMap(systemInfo.Name, 0)
+		app.ObjectQueue.SetSafeIndexMap(systemInfo.Name, 0)
 
 		// Initialize each system and store in the global map
 		system, err := systems.NewSystem(systemInfo)

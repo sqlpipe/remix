@@ -31,6 +31,7 @@ func main() {
 	flag.IntVar(&app.Config.Limiter.Burst, "limiter-burst", 100, "Rate limiter maximum burst")
 
 	flag.IntVar(&app.Config.MaxSnapshots, "max-snapshots", 100, "Maximum number of object store snapshots to keep in debug mode")
+	flag.IntVar(&app.Config.MaxRAMSizeMB, "max-ram-mb", 1024, "Maximum RAM size for seen objects in MB")
 
 	flag.Parse()
 
@@ -39,6 +40,12 @@ func main() {
 		fmt.Printf("Version:\t%s\n", vcs.Version())
 		os.Exit(0)
 	}
+
+	// Set the MaxRAMSize for seen objects from the config value (in MB)
+	// FirstObject    *Object
+	// CurrentRAMSize int64
+	// MaxRAMSize     int64
+	// app.DuplicateChecker.MaxRAMSize = int64(app.Config.MaxRAMSizeMB) * 1024 * 1024
 
 	// Map string log level to slog.Level
 	var level slog.Level

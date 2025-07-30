@@ -19,41 +19,39 @@ import (
 )
 
 type Postgresql struct {
-	db               *sql.DB
-	replConn         *pgconn.PgConn
-	systemInfo       SystemInfo
-	limiter          *rate.Limiter
-	duplicateChecker map[string][]*app.Object
+	db         *sql.DB
+	replConn   *pgconn.PgConn
+	systemInfo SystemInfo
+	limiter    *rate.Limiter
 }
 
-func newPostgresql(systemInfo SystemInfo) (Postgresql, error) {
+func newPostgresql(systemInfo SystemInfo) (*Postgresql, error) {
 
 	if len(systemInfo.PushMixer) == 0 && len(systemInfo.ReceiveMixer) == 0 {
-		return Postgresql{}, fmt.Errorf("systemInfo must have at least one of PushMixer or ReceiveMixer configured")
+		return nil, fmt.Errorf("systemInfo must have at least one of PushMixer or ReceiveMixer configured")
 	}
 
-	db, replConn, err := openPostgresConnections(systemInfo)
+	postgresql, err := createPostgreSQLStruct(systemInfo)
 	if err != nil {
-		return Postgresql{}, err
-	}
-
-	postgresql := Postgresql{
-		db:               db,
-		replConn:         replConn,
-		systemInfo:       systemInfo,
-		limiter:          rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
-		duplicateChecker: make(map[string][]*app.Object),
-	}
-	for schemaName := range app.SchemaMap {
-		postgresql.duplicateChecker[schemaName] = make([]*app.Object, 0)
+		return nil, err
 	}
 
 	if len(systemInfo.ReceiveMixer) == 0 {
-		app.Logger.Info("PostgreSQL initialized in push-only mode (no CDC)", "system", systemInfo.Name)
 		go postgresql.loop(0)
-		return postgresql, nil
+		app.Logger.Info("PostgreSQL initialized in push-only mode (no CDC)", "system", systemInfo.Name)
+		return &postgresql, nil
 	}
 
+	postgresql, err = initializeCDCMode(postgresql.db, postgresql.replConn, systemInfo, postgresql)
+	if err != nil {
+		return nil, err
+	}
+
+	return &postgresql, nil
+}
+
+// Helper function to initialize CDC mode for PostgreSQL
+func initializeCDCMode(db *sql.DB, replConn *pgconn.PgConn, systemInfo SystemInfo, postgresql Postgresql) (Postgresql, error) {
 	tableList, err := setupPublication(db, systemInfo.PublicationName, systemInfo.ReceiveMixer)
 	if err != nil {
 		return postgresql, fmt.Errorf("error setting up publication: %v", err)
@@ -91,26 +89,34 @@ func newPostgresql(systemInfo SystemInfo) (Postgresql, error) {
 	return postgresql, nil
 }
 
-// Helper to open the main and replication connections
-func openPostgresConnections(systemInfo SystemInfo) (db *sql.DB, replConn *pgconn.PgConn, err error) {
-	db, err = openConnectionPool(systemInfo.Name, systemInfo.ConnectionString, DriverPostgreSQL)
+// Helper to create PostgreSQL struct with connections
+func createPostgreSQLStruct(systemInfo SystemInfo) (Postgresql, error) {
+	db, err := openConnectionPool(systemInfo.Name, systemInfo.ConnectionString, DriverPostgreSQL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error opening PostgreSQL connection pool :: %v", err)
+		return Postgresql{}, fmt.Errorf("error opening PostgreSQL connection pool :: %v", err)
 	}
 
 	app.Logger.Info("PostgreSQL connection established", "system", systemInfo.Name)
 
-	replConn, err = pgconn.Connect(context.Background(), systemInfo.ReplicationDsn)
+	replConn, err := pgconn.Connect(context.Background(), systemInfo.ReplicationDsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("error opening postgresql replication connection :: %v", err)
+		return Postgresql{}, fmt.Errorf("error opening postgresql replication connection :: %v", err)
 	}
-	return db, replConn, nil
+
+	postgresql := Postgresql{
+		db:         db,
+		replConn:   replConn,
+		systemInfo: systemInfo,
+		limiter:    rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
+	}
+
+	return postgresql, nil
 }
 
 // Helper to setup publication
 func setupPublication(db *sql.DB, pubName string, receiveMixer ReceiveMixer) ([]string, error) {
 	if pubName == "" {
-		return nil, fmt.Errorf("publication_name must be set in systemInfo")
+		return nil, fmt.Errorf("publication_name must be set in yaml config file")
 	}
 	dropPubSQL := fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", pubName)
 	_, _ = db.Exec(dropPubSQL)
@@ -159,7 +165,7 @@ func setupReplicationSlot(replConn *pgconn.PgConn, slotName string) (sysident pg
 	return sysident, nil
 }
 
-// loop continuously processes safe objects from the ObjectStore and applies them to PostgreSQL.
+// loop continuously processes safe objects from the ObjectQueue and applies them to PostgreSQL.
 // It also manages logical replication by handling WAL (Write-Ahead Log) messages from PostgreSQL using the replication connection.
 // The function:
 //   - Applies upsert/delete operations to the database for new objects, avoiding duplicates.
@@ -182,9 +188,9 @@ func (p Postgresql) loop(startXLogPos pglogrepl.LSN) {
 			continue
 		}
 
-		// Get the last safe object index for this system from the ObjectStore
+		// Get the last safe object index for this system from the ObjectQueue
 		var exists bool
-		index, exists = app.ObjectStore.GetSafeIndexMap(p.systemInfo.Name)
+		index, exists = app.ObjectQueue.GetSafeIndexMap(p.systemInfo.Name)
 		if !exists {
 			panic(fmt.Sprintf("safe index not found for system %s", p.systemInfo.Name))
 		}
@@ -196,7 +202,7 @@ func (p Postgresql) loop(startXLogPos pglogrepl.LSN) {
 
 			// Update the safe index map for this system only if index has incremented
 			if index != prevIndex {
-				app.ObjectStore.SetSafeIndexMap(p.systemInfo.Name, index)
+				app.ObjectQueue.SetSafeIndexMap(p.systemInfo.Name, index)
 			}
 		}
 
@@ -212,9 +218,9 @@ func (p Postgresql) loop(startXLogPos pglogrepl.LSN) {
 	}
 }
 
-// processPushObjects processes safe objects from the ObjectStore and applies them to PostgreSQL.
+// processPushObjects processes safe objects from the ObjectQueue and applies them to PostgreSQL.
 func (p Postgresql) processPushObjects(index *int64) {
-	objects := app.ObjectStore.GetSafeObjectsFromIndex(*index)
+	objects := app.ObjectQueue.GetSafeObjectsFromIndex(*index)
 	if len(objects) > 0 {
 		*index += int64(len(objects))
 		if app.Config.LogLevel == "debug" {
@@ -224,70 +230,30 @@ func (p Postgresql) processPushObjects(index *int64) {
 
 	for _, object := range objects {
 
-		searchFields := []string{}
+		newObjects := applyPushMixer(object, p.systemInfo.PushMixer)
 
-		for locationInSystem, fields := range p.systemInfo.PushMixer[object.Type] {
-			newObj := app.Object{
-				Operation: object.Operation,
-				Type:      object.Type,
-				Payload:   make(map[string]any),
-			}
-			for keyInSchema, location := range fields {
-				if _, ok := object.Payload[keyInSchema]; ok {
-					newObj.Payload[location.Field] = object.Payload[keyInSchema]
-					if fields[keyInSchema].SearchKey {
-						searchFields = append(searchFields, location.Field)
-					}
-				}
-			}
-
-			// Duplicate check: see if this object was already processed
-			foundDuplicate := p.isDuplicate(object.Type, object.Operation, newObj.Payload)
-
+		for _, newObject := range newObjects {
+			foundDuplicate := app.DuplicateChecker.CheckIfSeen(&newObject)
 			if !foundDuplicate {
-				switch newObj.Operation {
-				case "upsert":
-					err := p.upsertJSON(newObj.Payload, searchFields, locationInSystem, newObj.Type, &object)
-					if err != nil {
-						app.Logger.Error("error upserting JSON to PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", object)
-					}
-				case "delete":
-					err := p.deleteFromPostgresql(newObj.Payload, searchFields, locationInSystem, &object)
-					if err != nil {
-						app.Logger.Error("error deleting from PostgreSQL", "error", err, "objectType", object.Type, "locationInSystem", locationInSystem, "data", newObj)
-					}
-				}
-			}
-		}
-	}
-}
 
-// Helper to check for duplicate objects and remove them if found
-func (p *Postgresql) isDuplicate(objectType, operation string, payload map[string]any) bool {
-	objs := p.duplicateChecker[objectType]
-	for i, obj := range objs {
-		objectIsDuplicate := true
-		if obj.Operation != operation {
-			objectIsDuplicate = false
-		} else {
-			for k, v := range payload {
-				if obj.Payload == nil {
-					objectIsDuplicate = false
-					break
-				}
-				if objVal, ok := obj.Payload[k]; !ok || v != objVal {
-					objectIsDuplicate = false
-					break
+				for locationInSystem := range p.systemInfo.PushMixer[object.Schema] {
+
+					switch newObject.Operation {
+					case "upsert":
+						err := p.upsertObject(newObject.Payload, locationInSystem, newObject.Schema, &newObject)
+						if err != nil {
+							app.Logger.Error("error upserting JSON to PostgreSQL", "error", err, "objectType", object.Schema, "locationInSystem", locationInSystem, "data", object)
+						}
+					case "delete":
+						err := p.deleteFromPostgresql(newObject.Payload, searchFields, locationInSystem, &object)
+						if err != nil {
+							app.Logger.Error("error deleting from PostgreSQL", "error", err, "objectType", object.Schema, "locationInSystem", locationInSystem, "data", newObject)
+						}
+					}
 				}
 			}
 		}
-		if objectIsDuplicate {
-			// Remove the duplicate from the slice
-			p.duplicateChecker[objectType] = append(objs[:i], objs[i+1:]...)
-			return true
-		}
 	}
-	return false
 }
 
 // processReplicationMessage handles standby status updates and incoming replication (CDC) messages.
@@ -356,19 +322,28 @@ func (p Postgresql) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	app.Logger.Error("PostgreSQL does not support webhooks", "system", p.systemInfo.Name)
 }
 
-func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locationInSystem string, objectType string, originalObj *app.Object) error {
+func (p Postgresql) upsertObject(object app.Object) error {
 
-	if app.Config.LogLevel == "debug" {
-		app.AddToDebugStore(app.DebugMessage{Payload: data, Operation: "Upserting into", System: p.systemInfo.Name})
+	searchKeys := []string{}
+
+	for _, field := range app.SchemaMap[object.Schema].SearchKeys {
+		_, ok := object.Payload[field]
+		if ok {
+			searchKeys = append(searchKeys, field)
+		}
 	}
 
-	var foundMatch bool
-	var conflictField string
-	var conflictValue any
+	for locationInSystem := range p.systemInfo.PushMixer[object.Schema] {
 
-	for _, field := range searchFields {
-		if v, ok := data[field]; ok {
-			// Check if a row exists with this search field
+		var foundMatch bool
+		var conflictField string
+		var conflictValue any
+
+		// Check if a row exists with this search field
+		for _, field := range searchKeys {
+
+			v := object.Payload[field]
+
 			query := fmt.Sprintf("SELECT 1 FROM %s WHERE %s = $1 LIMIT 1", locationInSystem, field)
 			row := p.db.QueryRow(query, v)
 			var dummy int
@@ -384,69 +359,69 @@ func (p Postgresql) upsertJSON(data map[string]any, searchFields []string, locat
 				app.Logger.Error("error checking for existing row", "error", err, "query", query, "value", v)
 				return fmt.Errorf("error checking for existing row: %v", err)
 			}
-		}
-	}
 
-	if foundMatch {
-		// Prepare UPDATE: set all columns except the conflict field
-		setCols := make([]string, 0, len(data))
-		values := make([]any, 0, len(data))
-		idx := 1
-		for k, v := range data {
-			if k != conflictField {
-				setCols = append(setCols, fmt.Sprintf("%s = $%d", k, idx))
-				values = append(values, v)
-				idx++
+			if foundMatch {
+				// Prepare UPDATE: set all columns except the conflict field
+				setCols := make([]string, 0, len(data))
+				values := make([]any, 0, len(data))
+				idx := 1
+				for k, v := range data {
+					if k != conflictField {
+						setCols = append(setCols, fmt.Sprintf("%s = $%d", k, idx))
+						values = append(values, v)
+						idx++
+					}
+				}
+				// Add WHERE for the conflict field
+				whereClause := fmt.Sprintf("%s = $%d", conflictField, idx)
+				values = append(values, conflictValue)
+
+				updateQuery := fmt.Sprintf(
+					"UPDATE %s SET %s WHERE %s",
+					locationInSystem,
+					strings.Join(setCols, ", "),
+					whereClause,
+				)
+
+				_, err := p.db.Exec(updateQuery, values...)
+				if err != nil {
+					app.Logger.Error("error executing update query", "error", err, "query", updateQuery, "values", values)
+					return fmt.Errorf("error executing update query: %v", err)
+				}
+			} else {
+				// Build INSERT
+				columns := make([]string, 0, len(data))
+				placeholders := make([]string, 0, len(data))
+				insertValues := make([]any, 0, len(data))
+
+				idx := 1
+				for k, v := range data {
+					columns = append(columns, k)
+					placeholders = append(placeholders, fmt.Sprintf("$%d", idx))
+					insertValues = append(insertValues, v)
+					idx++
+				}
+				insertQuery := fmt.Sprintf(
+					"INSERT INTO %s (%s) VALUES (%s)",
+					locationInSystem,
+					strings.Join(columns, ", "),
+					strings.Join(placeholders, ", "),
+				)
+				_, err := p.db.Exec(insertQuery, insertValues...)
+				if err != nil {
+					app.Logger.Error("error executing insert query", "error", err, "query", insertQuery, "values", insertValues)
+					return fmt.Errorf("error executing insert query: %v", err)
+				}
 			}
-		}
-		// Add WHERE for the conflict field
-		whereClause := fmt.Sprintf("%s = $%d", conflictField, idx)
-		values = append(values, conflictValue)
-
-		updateQuery := fmt.Sprintf(
-			"UPDATE %s SET %s WHERE %s",
-			locationInSystem,
-			strings.Join(setCols, ", "),
-			whereClause,
-		)
-
-		_, err := p.db.Exec(updateQuery, values...)
-		if err != nil {
-			app.Logger.Error("error executing update query", "error", err, "query", updateQuery, "values", values)
-			return fmt.Errorf("error executing update query: %v", err)
-		}
-	} else {
-		// Build INSERT
-		columns := make([]string, 0, len(data))
-		placeholders := make([]string, 0, len(data))
-		insertValues := make([]any, 0, len(data))
-
-		idx := 1
-		for k, v := range data {
-			columns = append(columns, k)
-			placeholders = append(placeholders, fmt.Sprintf("$%d", idx))
-			insertValues = append(insertValues, v)
-			idx++
-		}
-		insertQuery := fmt.Sprintf(
-			"INSERT INTO %s (%s) VALUES (%s)",
-			locationInSystem,
-			strings.Join(columns, ", "),
-			strings.Join(placeholders, ", "),
-		)
-		_, err := p.db.Exec(insertQuery, insertValues...)
-		if err != nil {
-			app.Logger.Error("error executing insert query", "error", err, "query", insertQuery, "values", insertValues)
-			return fmt.Errorf("error executing insert query: %v", err)
 		}
 	}
 
 	object := &app.Object{
-		Type:      objectType,
+		Schema:    objectSchema,
 		Operation: "upsert",
 		Payload:   data,
 	}
-	p.duplicateChecker[objectType] = append(p.duplicateChecker[objectType], object)
+	app.DuplicateChecker.AddObject(object)
 
 	return nil
 }
@@ -531,7 +506,7 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 				return fmt.Errorf("no schema found for pull location: %s", pullLocation)
 			}
 
-			err = schema.Validate(obj)
+			err = schema.Validator.Validate(obj)
 			if err != nil {
 				return fmt.Errorf("object failed postgresql schema validation for '%s': %v", pullLocation, err)
 			}
@@ -574,12 +549,12 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 
 				object := app.Object{
 					Operation: operationType,
-					Type:      schemaName,
+					Schema:    schemaName,
 					Payload:   obj,
 				}
 
 				// also add to storage engine
-				app.ObjectStore.AddSafeObject(object)
+				app.ObjectQueue.AddSafeObject(object)
 
 				if app.Config.LogLevel == "debug" {
 					app.AddToDebugStore(app.DebugMessage{Payload: object, Operation: "Adding to queue", System: p.systemInfo.Name})
@@ -587,7 +562,7 @@ func (p Postgresql) handleCdcEvent(jsonString string) error {
 
 				expiringObj := app.Object{
 					Operation: operationType,
-					Type:      schemaName,
+					Schema:    schemaName,
 					Payload:   obj,
 				}
 				p.duplicateChecker[schemaName] = append(p.duplicateChecker[schemaName], &expiringObj)
@@ -632,10 +607,10 @@ func (p Postgresql) deleteFromPostgresql(payload map[string]any, searchFields []
 
 	expiringObj := app.Object{
 		Operation: "delete",
-		Type:      originalObj.Type,
+		Schema:    originalObj.Schema,
 		Payload:   payload,
 	}
-	p.duplicateChecker[originalObj.Type] = append(p.duplicateChecker[originalObj.Type], &expiringObj)
+	p.duplicateChecker[originalObj.Schema] = append(p.duplicateChecker[originalObj.Schema], &expiringObj)
 
 	return nil
 }

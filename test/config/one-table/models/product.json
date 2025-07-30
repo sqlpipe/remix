@@ -1,6 +1,7 @@
 {
     "title": "product",
     "type": "object",
+    "search_keys": ["id", "stripe_id"],
     "properties": {
         "id": {
             "type": ["number", "null", "string"]
