@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/sqlpipe/remix/internal/app"
-	"github.com/sqlpipe/remix/internal/helpers"
 	"github.com/stripe/stripe-go/v82"
 	"golang.org/x/time/rate"
 )
@@ -211,9 +210,9 @@ func (s *Stripe) processPushObjects(index *int64) {
 						searchValue = fmt.Sprint(newObj.Payload[field.Field])
 					}
 				}
-				if field.Hardcode != nil && !helpers.IsZeroValue(field.Hardcode) {
-					newObj.Payload[field.Field] = field.Hardcode
-				}
+				// if field.Hardcode != nil && !helpers.IsZeroValue(field.Hardcode) {
+				// 	newObj.Payload[field.Field] = field.Hardcode
+				// }
 			}
 
 			if !app.DuplicateChecker.CheckIfSeen(&newObj) {

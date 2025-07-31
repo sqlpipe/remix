@@ -36,16 +36,19 @@ var (
 type Field struct {
 	Field     string `yaml:"field" json:"field"`
 	SearchKey bool   `yaml:"search_key,omitempty" json:"search_key,omitempty"`
-	Hardcode  any    `yaml:"hardcode,omitempty" json:"hardcode,omitempty"`
+	// Hardcode  any    `yaml:"hardcode,omitempty" json:"hardcode,omitempty"`
 }
 
-type PullObject map[string]Field
-type PullLocation map[string]PullObject
 type ReceiveMixer map[string]PullLocation
+type PullLocation map[string]PullSchema
+type PullSchema map[string]Field
 
-type PushMixer map[string]PushObject
-type PushObject map[string]PushLocation
-type PushLocation map[string]Field
+type PushMixer map[string]PushSchema
+type PushSchema map[string]PushLocation
+type PushLocation struct {
+	Fields     map[string]Field `yaml:"fields" json:"fields"`
+	SearchKeys []string         `yaml:"search_keys" json:"search_keys"`
+}
 
 type SystemInfo struct {
 	Name                string        `yaml:"name" json:"name"`
@@ -66,8 +69,8 @@ type SystemInfo struct {
 	RateLimit           int           `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
 	RateBucketSize      int           `yaml:"rate_bucket_size,omitempty" json:"rate_bucket_size,omitempty"`
 	UseCliListener      bool          `yaml:"use_cli_listener,omitempty" json:"use_cli_listener,omitempty"`
-	ReceiveMixer        ReceiveMixer  `yaml:"receive_mixer,omitempty" json:"receive_mixer,omitempty"`
-	PushMixer           PushMixer     `yaml:"push_mixer,omitempty" json:"push_mixer,omitempty"`
+	ReceiveMixer        *ReceiveMixer `yaml:"receive_mixer,omitempty" json:"receive_mixer,omitempty"`
+	PushMixer           *PushMixer    `yaml:"push_mixer,omitempty" json:"push_mixer,omitempty"`
 	ReplicationSlotName string        `yaml:"replication_slot_name,omitempty" json:"replication_slot_name,omitempty"`
 	PublicationName     string        `yaml:"publication_name,omitempty" json:"publication_name,omitempty"`
 }
@@ -76,7 +79,7 @@ type SystemInterface interface {
 	HandleWebhook(w http.ResponseWriter, r *http.Request)
 }
 
-func NewSystem(systemInfo SystemInfo) (system SystemInterface, err error) {
+func NewSystem(systemInfo *SystemInfo) (system SystemInterface, err error) {
 	switch systemInfo.Type {
 	case TypePostgreSQL:
 		return newPostgresql(systemInfo)

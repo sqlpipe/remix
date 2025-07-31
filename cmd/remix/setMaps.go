@@ -69,28 +69,26 @@ func findConfigFiles() (schemaFiles []string, systemFiles []string, err error) {
 }
 
 // readRawSchema reads and decodes the JSON schema file.
-func readRawSchema(path string) (map[string]interface{}, error) {
+func readRawSchema(path string) (map[string]any, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open schema file %s: %w", path, err)
 	}
 	defer file.Close()
 
-	var raw map[string]interface{}
-	if err := json.NewDecoder(file).Decode(&raw); err != nil {
+	raw := map[string]any{}
+	if err := json.NewDecoder(file).Decode(raw); err != nil {
 		return nil, fmt.Errorf("failed to decode schema file %s: %w", path, err)
 	}
 	return raw, nil
 }
 
 // extractSearchKeys extracts the search_keys field as a []string.
-func extractSearchKeys(raw map[string]interface{}) []string {
+func extractSearchKeys(raw map[string]any) []string {
 	var searchKeys []string
-	if keys, ok := raw["search_keys"].([]interface{}); ok {
-		for _, k := range keys {
-			if s, ok := k.(string); ok {
-				searchKeys = append(searchKeys, s)
-			}
+	if keys, ok := raw["search_keys"].([]string); ok {
+		for _, key := range keys {
+			searchKeys = append(searchKeys, key)
 		}
 	}
 	return searchKeys
@@ -137,7 +135,7 @@ func setSchemaMap(schemaFiles []string) error {
 
 // setSystemMap loads all system YAML files, decodes them into SystemInfo, and initializes systems in the global map.
 func setSystemMap(systemFiles []string) error {
-	systemInfoMap := map[string]systems.SystemInfo{}
+	systemInfoMap := map[string]*systems.SystemInfo{}
 
 	for _, path := range systemFiles {
 		f, err := os.Open(path)
@@ -146,9 +144,9 @@ func setSystemMap(systemFiles []string) error {
 		}
 		defer f.Close()
 
-		var sysInfo systems.SystemInfo
+		sysInfo := &systems.SystemInfo{}
 		decoder := yaml.NewDecoder(f)
-		err = decoder.Decode(&sysInfo)
+		err = decoder.Decode(sysInfo)
 		if err != nil {
 			return fmt.Errorf("failed to decode system file %s: %w", path, err)
 		}
@@ -162,7 +160,7 @@ func setSystemMap(systemFiles []string) error {
 
 		app.Logger.Debug("initializing new system", "name", systemInfo.Name, "type", systemInfo.Type)
 
-		app.ObjectQueue.SetSafeIndexMap(systemInfo.Name, 0)
+		app.ObjectQueue.SetSafeIndex(systemInfo.Name, 0, systemInfo.Name)
 
 		// Initialize each system and store in the global map
 		system, err := systems.NewSystem(systemInfo)
