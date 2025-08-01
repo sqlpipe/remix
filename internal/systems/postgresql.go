@@ -27,8 +27,9 @@ type Postgresql struct {
 
 func newPostgresql(systemInfo *SystemInfo) (*Postgresql, error) {
 
-	if len(*systemInfo.PushMixer) == 0 && len(*systemInfo.ReceiveMixer) == 0 {
-		return nil, fmt.Errorf("systemInfo must have at least one of PushMixer or ReceiveMixer configured")
+	err := validatePostgreSQLSystemInfo(systemInfo)
+	if err != nil {
+		return nil, err
 	}
 
 	postgresql, err := createPostgreSQLStruct(systemInfo)
@@ -36,7 +37,8 @@ func newPostgresql(systemInfo *SystemInfo) (*Postgresql, error) {
 		return nil, err
 	}
 
-	if len(*systemInfo.ReceiveMixer) == 0 {
+	// start loop without cdc if receive mixer is nil
+	if systemInfo.ReceiveMixer == nil {
 		go postgresql.loop(0)
 		app.Logger.Info("PostgreSQL initialized in push-only mode (no CDC)", "system", systemInfo.Name)
 		return postgresql, nil
@@ -52,7 +54,7 @@ func newPostgresql(systemInfo *SystemInfo) (*Postgresql, error) {
 
 // Helper function to initialize CDC mode for PostgreSQL
 func initializeCDCMode(db *sql.DB, replConn *pgconn.PgConn, systemInfo *SystemInfo, postgresql *Postgresql) error {
-	tableList, err := setupPublication(db, systemInfo.PublicationName, systemInfo.ReceiveMixer)
+	err := setupPublication(db, systemInfo.PublicationName, systemInfo.ReceiveMixer)
 	if err != nil {
 		return fmt.Errorf("error setting up publication: %v", err)
 	}
@@ -62,26 +64,15 @@ func initializeCDCMode(db *sql.DB, replConn *pgconn.PgConn, systemInfo *SystemIn
 		return fmt.Errorf("error setting up replication slot: %v", err)
 	}
 
-	app.Logger.Info("PostgreSQL initialized in CDC mode",
-		"system", systemInfo.Name,
-		"publication", systemInfo.PublicationName,
-		"tables", tableList,
-		"slot", systemInfo.ReplicationSlotName,
-	)
-
 	pluginArguments := []string{}
-
 	if app.Config.LogLevel == "debug" {
 		pluginArguments = append(pluginArguments, "\"pretty-print\" 'true'")
 	}
 
-	err = pglogrepl.StartReplication(context.Background(), replConn, systemInfo.ReplicationSlotName, sysident.XLogPos,
-		pglogrepl.StartReplicationOptions{
-			PluginArgs: pluginArguments,
-		})
+	startReplicationOptions := pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments}
+	err = pglogrepl.StartReplication(context.Background(), replConn, systemInfo.ReplicationSlotName, sysident.XLogPos, startReplicationOptions)
 	if err != nil {
-		app.Logger.Error("StartReplication failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("StartReplication failed: %v", err)
 	}
 
 	go postgresql.loop(sysident.XLogPos)
@@ -96,7 +87,7 @@ func createPostgreSQLStruct(systemInfo *SystemInfo) (*Postgresql, error) {
 		return nil, fmt.Errorf("error opening PostgreSQL connection pool :: %v", err)
 	}
 
-	app.Logger.Info("PostgreSQL connection established", "system", systemInfo.Name)
+	app.Logger.Info("PostgreSQL connection pool established", "system", systemInfo.Name)
 
 	replConn, err := pgconn.Connect(context.Background(), systemInfo.ReplicationDsn)
 	if err != nil {
@@ -110,13 +101,15 @@ func createPostgreSQLStruct(systemInfo *SystemInfo) (*Postgresql, error) {
 		limiter:    rate.NewLimiter(rate.Limit(systemInfo.RateLimit), systemInfo.RateBucketSize),
 	}
 
+	app.Logger.Info("PostgreSQL replication connection established", "system", systemInfo.Name)
+
 	return postgresql, nil
 }
 
 // Helper to setup publication
-func setupPublication(db *sql.DB, pubName string, receiveMixer *ReceiveMixer) ([]string, error) {
+func setupPublication(db *sql.DB, pubName string, receiveMixer *ReceiveMixer) error {
 	if pubName == "" {
-		return nil, fmt.Errorf("publication_name must be set in yaml config file")
+		return fmt.Errorf("publication_name must be set in yaml config file")
 	}
 	dropPubSQL := fmt.Sprintf("DROP PUBLICATION IF EXISTS %s;", pubName)
 	_, _ = db.Exec(dropPubSQL)
@@ -131,7 +124,7 @@ func setupPublication(db *sql.DB, pubName string, receiveMixer *ReceiveMixer) ([
 	}
 
 	if len(tableList) == 0 {
-		return tableList, nil // push-only mode
+		return nil // push-only mode
 	}
 
 	createPubSQL := ""
@@ -142,9 +135,9 @@ func setupPublication(db *sql.DB, pubName string, receiveMixer *ReceiveMixer) ([
 	}
 	_, err := db.Exec(createPubSQL)
 	if err != nil && !strings.Contains(err.Error(), "already exists") {
-		return nil, fmt.Errorf("failed to create publication: %v", err)
+		return fmt.Errorf("failed to create publication: %v", err)
 	}
-	return tableList, nil
+	return nil
 }
 
 // Helper to setup replication slot
@@ -165,40 +158,38 @@ func setupReplicationSlot(replConn *pgconn.PgConn, slotName string) (*pglogrepl.
 	return &sysident, nil
 }
 
-func (p *Postgresql) loop(startXLogPos pglogrepl.LSN) {
-	clientXLogPos := startXLogPos
+func (p *Postgresql) loop(xLogPos pglogrepl.LSN) {
 	nextStandbyMessageDeadline := time.Now().Add(time.Second * 10)
-	var index int64
 
 	for {
-		// Wait for the rate limiter to allow the next operation
+		// Wait for the rate limiter to allow the next iteration
 		err := p.limiter.Wait(context.Background())
 		if err != nil {
 			app.Logger.Warn("error waiting for rate limiter", "error", err, "system", p.systemInfo.Name)
-			return
+			continue
 		}
 
 		// Get the last safe object index for this system from the ObjectQueue
 		var exists bool
-		index, exists = app.ObjectQueue.GetSafeIndex(p.systemInfo.Name, p.systemInfo.Name)
+		index, exists := app.ObjectQueue.GetSafeIndex(p.systemInfo.Name)
 		if !exists {
 			app.Logger.Error("safe index not found for system", "system", p.systemInfo.Name)
-			return
+			os.Exit(1)
 		}
 
 		if p.systemInfo.PushMixer != nil {
 			index, err = p.processQueue(index)
 			if err != nil {
-				app.Logger.Error("error in queue processing", "error", err)
-				return
+				app.Logger.Error("error in queue processing", "error", err, "system", p.systemInfo.Name)
+				continue
 			}
 		}
 
 		if p.systemInfo.ReceiveMixer != nil {
-			err = p.processReplicationMessage(clientXLogPos, &nextStandbyMessageDeadline)
+			xLogPos, nextStandbyMessageDeadline, err = p.processReplicationMessage(xLogPos, nextStandbyMessageDeadline)
 			if err != nil {
 				app.Logger.Error("error in replication message processing", "error", err)
-				return
+				continue
 			}
 		}
 	}
@@ -206,6 +197,7 @@ func (p *Postgresql) loop(startXLogPos pglogrepl.LSN) {
 
 // processPushObjects processes safe objects from the ObjectQueue and applies them to PostgreSQL.
 func (p *Postgresql) processQueue(index int64) (int64, error) {
+
 	objects := app.ObjectQueue.GetSafeObjectsFromIndex(index, p.systemInfo.Name)
 
 	for _, object := range objects {
@@ -225,69 +217,70 @@ func (p *Postgresql) processQueue(index int64) (int64, error) {
 						return index, fmt.Errorf("error deleting from PostgreSQL: %v", err)
 					}
 				}
+
+				app.DuplicateChecker.AddObject(object)
 			}
 		}
 	}
 
 	if len(objects) > 0 {
 		index += int64(len(objects))
-		app.ObjectQueue.SetSafeIndex(p.systemInfo.Name, index, p.systemInfo.Name)
+		app.ObjectQueue.SetSafeIndex(p.systemInfo.Name, index)
 	}
 
 	return index, nil
 }
 
-// processReplicationMessage handles standby status updates and incoming replication (CDC) messages.
-func (p *Postgresql) processReplicationMessage(clientXLogPos pglogrepl.LSN, nextStandbyMessageDeadline *time.Time) error {
+func (p *Postgresql) processReplicationMessage(clientXLogPos pglogrepl.LSN, nextStandbyMessageDeadline time.Time) (pglogrepl.LSN, time.Time, error) {
 	// Send a standby status update to the replication connection if needed
-	if time.Now().After(*nextStandbyMessageDeadline) {
+	if time.Now().After(nextStandbyMessageDeadline) {
 		err := pglogrepl.SendStandbyStatusUpdate(context.Background(), p.replConn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
 		if err != nil {
-			return fmt.Errorf("SendStandbyStatusUpdate failed: %v", err)
+			return clientXLogPos, nextStandbyMessageDeadline, fmt.Errorf("SendStandbyStatusUpdate failed: %v", err)
 		}
-		*nextStandbyMessageDeadline = time.Now().Add(time.Second * 10)
+		nextStandbyMessageDeadline = time.Now().Add(time.Second * 10)
 	}
 
-	ctx, cancel := context.WithDeadline(context.Background(), *nextStandbyMessageDeadline)
+	ctx, cancel := context.WithDeadline(context.Background(), nextStandbyMessageDeadline)
 	rawMsg, err := p.replConn.ReceiveMessage(ctx)
 	cancel()
 	if err != nil {
 		if pgconn.Timeout(err) {
-			return nil // Not fatal, just continue
+			return clientXLogPos, nextStandbyMessageDeadline, nil // Not fatal, just continue
 		}
-		return fmt.Errorf("ReceiveMessage failed: %v", err)
+		return clientXLogPos, nextStandbyMessageDeadline, fmt.Errorf("ReceiveMessage failed: %v", err)
 	}
 
 	if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
-		return fmt.Errorf("received Postgres WAL error: %+v", errMsg)
+		return clientXLogPos, nextStandbyMessageDeadline, fmt.Errorf("received Postgres WAL error: %+v", errMsg)
 	}
 
 	msg, ok := rawMsg.(*pgproto3.CopyData)
 	if !ok {
 		log.Printf("Received unexpected message: %T\n", rawMsg)
-		return nil // Not fatal, just continue
+		return clientXLogPos, nextStandbyMessageDeadline, nil // Not fatal, just continue
 	}
 
 	switch msg.Data[0] {
 	case pglogrepl.PrimaryKeepaliveMessageByteID:
 		pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
 		if err != nil {
-			return fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %v", err)
+			return clientXLogPos, nextStandbyMessageDeadline, fmt.Errorf("ParsePrimaryKeepaliveMessage failed: %v", err)
 		}
 		if pkm.ServerWALEnd > clientXLogPos {
 			clientXLogPos = pkm.ServerWALEnd
 		}
 		if pkm.ReplyRequested {
-			*nextStandbyMessageDeadline = time.Time{}
+			nextStandbyMessageDeadline = time.Time{}
 		}
 	case pglogrepl.XLogDataByteID:
 		xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
 		if err != nil {
-			return fmt.Errorf("ParseXLogData failed: %v", err)
+			return clientXLogPos, nextStandbyMessageDeadline, fmt.Errorf("ParseXLogData failed: %v", err)
 		}
 		err = p.handleCdcEvent(&xld)
 		if err != nil {
-			return fmt.Errorf("error handling CDC event: %v", err)
+			return clientXLogPos, nextStandbyMessageDeadline, fmt.Errorf("error handling CDC event: %v", err)
 		}
 		if xld.WALStart > clientXLogPos {
 			clientXLogPos = xld.WALStart
@@ -295,7 +288,7 @@ func (p *Postgresql) processReplicationMessage(clientXLogPos pglogrepl.LSN, next
 	default:
 		// Ignore other message types
 	}
-	return nil
+	return clientXLogPos, nextStandbyMessageDeadline, nil
 }
 
 type OldKeys struct {
@@ -392,48 +385,38 @@ func (p *Postgresql) upsertObject(object *app.Object) error {
 		}
 	}
 
-	app.DuplicateChecker.AddObject(object)
-
 	return nil
 }
 
 // deleteFromPostgresql deletes a row from PostgreSQL based on the searchFields and payload.
 func (p *Postgresql) deleteObject(object *app.Object) error {
 
-	if len(searchFields) == 0 {
-		return fmt.Errorf("no search fields provided for delete operation")
-	}
+	for locationInSystem := range (*p.systemInfo.PushMixer)[object.Schema] {
 
-	if app.Config.LogLevel == "debug" {
-		app.AddToDebugStore(app.DebugMessage{Payload: payload, Operation: "Deleting from", System: p.systemInfo.Name})
-	}
-
-	whereClauses := make([]string, 0, len(searchFields))
-	values := make([]any, 0, len(searchFields))
-	idx := 1
-	for _, field := range searchFields {
-		val, ok := payload[field]
-		if !ok {
-			return fmt.Errorf("search field '%s' not found in payload", field)
+		presentSearchKeys := []string{}
+		for _, field := range (*p.systemInfo.PushMixer)[object.Schema][locationInSystem].SearchKeys {
+			_, ok := object.Payload[field]
+			if ok {
+				presentSearchKeys = append(presentSearchKeys, field)
+			}
 		}
-		whereClauses = append(whereClauses, fmt.Sprintf("%s = $%d", field, idx))
-		values = append(values, val)
-		idx++
-	}
 
-	deleteQuery := fmt.Sprintf("DELETE FROM %s WHERE %s", locationInSystem, strings.Join(whereClauses, " AND "))
-	_, err := p.db.Exec(deleteQuery, values...)
-	if err != nil {
-		app.Logger.Error("error executing delete query", "error", err, "query", deleteQuery, "values", values)
-		return fmt.Errorf("error executing delete query: %v", err)
-	}
+		whereClause := []string{}
+		for _, field := range presentSearchKeys {
+			whereClause = append(whereClause, fmt.Sprintf("%v = %v", field, object.Payload[field]))
+		}
 
-	expiringObj := app.Object{
-		Operation: "delete",
-		Schema:    originalObj.Schema,
-		Payload:   payload,
+		query := fmt.Sprintf(`delete from %v where %v;`, locationInSystem, strings.Join(whereClause, " OR "))
+
+		if app.Config.LogLevel == "debug" {
+			app.AddToDebugStore(app.DebugMessage{Payload: object.Payload, Operation: fmt.Sprintf("Deleting from %v", locationInSystem), System: p.systemInfo.Name})
+		}
+
+		_, err := p.db.Exec(query)
+		if err != nil {
+			return fmt.Errorf("error executing delete query: %v", err)
+		}
 	}
-	p.duplicateChecker[originalObj.Schema] = append(p.duplicateChecker[originalObj.Schema], &expiringObj)
 
 	return nil
 }
@@ -476,4 +459,11 @@ func (p *Postgresql) createObjectsromCDCEvent(change *CdcChange) (map[string]*ap
 	}
 
 	return incomingObjects, nil
+}
+
+func validatePostgreSQLSystemInfo(systemInfo *SystemInfo) error {
+	if len(*systemInfo.PushMixer) == 0 && len(*systemInfo.ReceiveMixer) == 0 {
+		return fmt.Errorf("systemInfo must have at least one of PushMixer or ReceiveMixer configured")
+	}
+	return nil
 }

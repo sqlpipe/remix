@@ -83,10 +83,10 @@ func NewSystem(systemInfo *SystemInfo) (system SystemInterface, err error) {
 	switch systemInfo.Type {
 	case TypePostgreSQL:
 		return newPostgresql(systemInfo)
-	case TypeSnowflake:
-		return newSnowflake(systemInfo)
 	case TypeStripe:
 		return newStripe(systemInfo)
+		// case TypeSnowflake:
+		// 	return newSnowflake(systemInfo)
 	default:
 		return system, fmt.Errorf("unsupported system type %v", systemInfo.Type)
 	}

@@ -22,10 +22,10 @@ var ObjectQueue = &objectQueue{
 	safeObjects:  make([]*Object, 0),
 }
 
-func (s *objectQueue) GetSafeIndex(key string, systemName string) (int64, bool) {
+func (s *objectQueue) GetSafeIndex(systemName string) (int64, bool) {
 	s.indexMapMu.RLock()
 	defer s.indexMapMu.RUnlock()
-	index, exists := s.safeIndexMap[key]
+	index, exists := s.safeIndexMap[systemName]
 
 	if Config.LogLevel == "debug" {
 		AddToDebugStore(DebugMessage{Payload: index, Operation: "Got safe index map", System: systemName})
@@ -34,10 +34,10 @@ func (s *objectQueue) GetSafeIndex(key string, systemName string) (int64, bool) 
 	return index, exists
 }
 
-func (s *objectQueue) SetSafeIndex(key string, index int64, systemName string) {
+func (s *objectQueue) SetSafeIndex(systemName string, index int64) {
 	s.indexMapMu.Lock()
 	defer s.indexMapMu.Unlock()
-	s.safeIndexMap[key] = index
+	s.safeIndexMap[systemName] = index
 
 	if Config.LogLevel == "debug" {
 		AddToDebugStore(DebugMessage{Payload: index, Operation: "Set safe index map", System: systemName})
