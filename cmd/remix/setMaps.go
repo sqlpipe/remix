@@ -160,7 +160,7 @@ func setSystemMap(systemFiles []string) error {
 
 		app.Logger.Debug("initializing new system", "name", systemInfo.Name, "type", systemInfo.Type)
 
-		app.ObjectQueue.SetSafeIndex(systemInfo.Name, 0, systemInfo.Name)
+		app.ObjectQueue.SetSafeIndex(systemInfo.Name, 0)
 
 		// Initialize each system and store in the global map
 		system, err := systems.NewSystem(systemInfo)

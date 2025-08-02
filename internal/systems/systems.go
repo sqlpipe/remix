@@ -46,8 +46,7 @@ type PullSchema map[string]Field
 type PushMixer map[string]PushSchema
 type PushSchema map[string]PushLocation
 type PushLocation struct {
-	Fields     map[string]Field `yaml:"fields" json:"fields"`
-	SearchKeys []string         `yaml:"search_keys" json:"search_keys"`
+	Fields map[string]Field `yaml:"fields" json:"fields"`
 }
 
 type SystemInfo struct {

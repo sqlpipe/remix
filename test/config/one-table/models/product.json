@@ -4,7 +4,7 @@
     "search_keys": ["id", "stripe_id"],
     "properties": {
         "id": {
-            "type": ["number", "null", "string"]
+            "type": ["number", "string", "null"]
         },
         "stripe_id": {
             "type": ["string", "null"]
@@ -13,7 +13,7 @@
             "type": "string"
         },
         "price": {
-            "type": ["number", "null"]
+            "type": ["string", "null"]
         }
     }
 }

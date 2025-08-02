@@ -25,7 +25,13 @@ type Stripe struct {
 	baseURL    string
 }
 
-func newStripe(systemInfo *SystemInfo) (system SystemInterface, err error) {
+func newStripe(systemInfo *SystemInfo) (SystemInterface, error) {
+
+	err := validateStripeSystemInfo(systemInfo)
+	if err != nil {
+		return nil, err
+	}
+
 	if systemInfo.UseCliListener {
 		err = startStripeCliListener(systemInfo)
 		if err != nil {
@@ -41,6 +47,29 @@ func newStripe(systemInfo *SystemInfo) (system SystemInterface, err error) {
 	go stripeStruct.loop()
 
 	return stripeStruct, nil
+}
+
+func validateStripeSystemInfo(systemInfo *SystemInfo) error {
+	if systemInfo.ApiKey == "" {
+		return fmt.Errorf("api key is required")
+	}
+
+	if systemInfo.PushMixer != nil {
+		for schemaName, schema := range *systemInfo.PushMixer {
+			for locationName, location := range schema {
+				numSearchKeys := 0
+				for _, field := range location.Fields {
+					if field.SearchKey {
+						numSearchKeys += 1
+						if numSearchKeys > 1 {
+							return fmt.Errorf("stripe push locations (and APIs in general) can only have one search_key. %v.%v has more than 1", schemaName, locationName)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Helper to parse Stripe event type into objectName and operationType
